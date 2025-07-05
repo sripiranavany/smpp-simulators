@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json" // Import for JSON parsing
+	"errors"        // <--- ADDED: for errors.Is
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"time" // <--- ADDED: for time.Sleep and SetReadDeadline
 )
 
 // UserConfig holds the user simulator configuration parameters
@@ -34,18 +36,48 @@ func LoadUserConfig(filePath string) (*UserConfig, error) {
 }
 
 // receiveMessages listens for messages from the server and prints them
-func receiveMessages(conn net.Conn) {
+// It now accepts a stop channel to signal graceful exit.
+func receiveMessages(conn net.Conn, stopChan <-chan struct{}) { // <--- MODIFIED: Added stopChan parameter
 	reader := bufio.NewReader(conn)
 	for {
+		select {
+		case <-stopChan: // <--- NEW: Listen for stop signal
+			log.Println("Stopping message receiver goroutine.")
+			return // Exit the goroutine gracefully
+		default:
+			// Continue reading
+		}
+
+		// <--- NEW: Set a short read deadline. This prevents ReadString from blocking indefinitely
+		// and allows the select statement to check stopChan regularly.
+		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			log.Printf("Error setting read deadline for user receiver: %v", err)
+			return // Critical error, exit
+		}
+
 		message, err := reader.ReadString('\n') // Reads until newline
 		if err != nil {
-			if err == io.EOF {
+			// <--- NEW: Check if the error is a timeout from the deadline
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // It was just a timeout, loop again to check stop signal
+			}
+			// Handle actual connection errors (EOF, network errors)
+			if errors.Is(err, io.EOF) { // <--- Use errors.Is for EOF
 				log.Println("Server closed the connection gracefully.")
 			} else {
 				log.Printf("Error receiving message from server: %v", err)
 			}
-			break
+			break // Exit loop on real error
 		}
+
+		// <--- NEW: Clear the read deadline after a successful read
+		// This is important because the next read should not be prematurely timed out
+		// if the server is slow but still sending data.
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("Error clearing read deadline: %v", err)
+			// Not critical enough to exit, but log it
+		}
+
 		// Parse the incoming message if it follows a specific protocol
 		// Expected format from server: FROM_SMSC|DEST_ADDR|TYPE|MESSAGE
 		parts := strings.SplitN(strings.TrimSpace(message), "|", 4)
@@ -73,7 +105,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to SMPP server's user port %s: %v", serverAddress, err)
 	}
-	defer conn.Close() // Ensure connection is closed when main exits
+	// defer conn.Close() // <--- REMOVED: We will close it manually for precise control
 
 	log.Printf("Connected to SMPP server's user port at %s", serverAddress)
 	fmt.Println("Welcome to the User Simulator!")
@@ -83,9 +115,12 @@ func main() {
 	fmt.Println("Example USSD: +12345|98765|USSD|*123#")
 	fmt.Println("Type 'exit' to quit.")
 
-	// --- NEW: Start goroutine to receive messages from the server ---
-	go receiveMessages(conn) // <--- START THIS GOROUTINE
-	// --- END NEW ---
+	// <--- NEW: Create the stop channel for the receiver goroutine ---
+	stopReceiving := make(chan struct{})
+
+	// --- MODIFIED: Start goroutine to receive messages from the server, passing the stop channel ---
+	go receiveMessages(conn, stopReceiving) // <--- Pass the stop channel
+	// --- END MODIFIED ---
 
 	reader := bufio.NewReader(os.Stdin) // Reads user input from terminal
 	for {
@@ -105,5 +140,20 @@ func main() {
 		}
 	}
 
-	log.Println("User simulator exited.")
+	log.Println("User simulator exiting...") // <--- MODIFIED: Log before actual exit and close
+	// <--- NEW: Signal the receiver goroutine to stop and give it time to clean up ---
+	close(stopReceiving)               // Signal the receiver goroutine to stop
+	time.Sleep(100 * time.Millisecond) // Give the receiver a moment to exit (adjust if needed)
+	// --- END NEW ---
+
+	// <--- NEW: Explicitly close the connection after the receiver has stopped ---
+	if conn != nil {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing network connection: %v", err)
+		} else {
+			log.Println("Network connection closed.")
+		}
+	}
+
+	log.Println("User simulator exited.") // Final exit log
 }

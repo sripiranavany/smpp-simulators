@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors" // <--- ADD THIS IMPORT
 	"fmt"
+	"io" // <--- ADD THIS IMPORT
 	"log"
 	"net"
 	"os"
@@ -80,10 +82,18 @@ type SMPPClient struct {
 	systemID   string
 	password   string
 	bound      bool
-	sequenceNo uint32
-	mutex      sync.Mutex
+	sequenceNo uint32     // Your existing sequence number
+	mutex      sync.Mutex // Your existing mutex for sequenceNo and general access
 	serverAddr string
 	serverPort int
+
+	// --- Fields you pointed out that were missing, and their related mutex ---
+	respChan  map[uint32]chan *PDU // Map to hold channels for PDU responses, keyed by sequence number
+	respMutex sync.Mutex           // Mutex to protect access to respChan
+	bindType  byte                 // To store the type of bind performed (e.g., BIND_TRANSCEIVER)
+	// --- End of re-added fields ---
+
+	stopReading chan struct{} // <--- Keep this for graceful shutdown
 }
 
 // Message for sending
@@ -111,6 +121,11 @@ func NewSMPPClient(serverAddr string, serverPort int, systemID, password string)
 		serverPort: serverPort,
 		systemID:   systemID,
 		password:   password,
+		sequenceNo: 0,                          // Initialize sequence number
+		respChan:   make(map[uint32]chan *PDU), // <--- INITIALIZE THIS MAP
+		// respMutex will be zero-value initialized, which is fine
+		stopReading: make(chan struct{}), // <--- Keep this initialized
+		// bindType is typically set during the bind process (e.g., in Bind() method)
 	}
 }
 
@@ -142,7 +157,7 @@ func (c *SMPPClient) Connect() error {
 	log.Printf("Connected to SMPP server at %s:%d", c.serverAddr, c.serverPort)
 
 	// Start receiving PDUs
-	go c.receivePDUs()
+	go c.receivePDUs() // This goroutine will now respect the stopReading channel
 
 	return nil
 }
@@ -260,11 +275,31 @@ func (c *SMPPClient) Unbind() error {
 
 	err := c.sendPDU(pdu)
 	if err != nil {
-		return err
+		log.Printf("Error sending unbind request: %v", err)
+		// Even if sending unbind fails, we should still try to close gracefully
+	} else {
+		log.Printf("Sent unbind request")
 	}
 
+	// --- IMPORTANT: Signal the reader goroutine to stop before closing the connection ---
+	close(c.stopReading) // <--- Signal to stop
+	log.Println("Signaled PDU reader to stop.")
+	time.Sleep(100 * time.Millisecond) // Give reader a moment to process signal and exit
+	// --- END IMPORTANT ---
+
+	// The server will send UNBIND_RESP, which the receivePDUs goroutine will handle
+	// before it exits due to the stopReading signal.
+	// After that, it's safe to close the connection.
+	if c.conn != nil {
+		err := c.conn.Close() // <--- Close the network connection
+		if err != nil {
+			log.Printf("Error closing network connection: %v", err)
+		} else {
+			log.Println("Network connection closed.")
+		}
+	}
 	c.bound = false
-	return nil
+	return err // Return the error from sending Unbind, if any
 }
 
 // Build submit_sm body
@@ -333,6 +368,32 @@ func (c *SMPPClient) buildSubmitSMBody(msg *ClientMessage) []byte {
 	return body
 }
 
+func (c *SMPPClient) SendPDUAndWait(pdu *PDU) (*PDU, error) {
+	respCh := make(chan *PDU, 1) // Buffered channel
+	c.respMutex.Lock()
+	c.respChan[pdu.Header.SequenceNo] = respCh
+	c.respMutex.Unlock()
+
+	defer func() { // Clean up the channel from the map
+		c.respMutex.Lock()
+		delete(c.respChan, pdu.Header.SequenceNo)
+		c.respMutex.Unlock()
+	}()
+
+	err := c.sendPDU(pdu) // Your existing sendPDU
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for response with a timeout
+	select {
+	case resp := <-respCh:
+		return resp, nil
+	case <-time.After(10 * time.Second): // Example timeout
+		return nil, fmt.Errorf("PDU response timeout for sequence %d", pdu.Header.SequenceNo)
+	}
+}
+
 // Send PDU
 func (c *SMPPClient) sendPDU(pdu *PDU) error {
 	buf := new(bytes.Buffer)
@@ -349,13 +410,43 @@ func (c *SMPPClient) sendPDU(pdu *PDU) error {
 	return err
 }
 
-// Receive PDUs
+// Receive PDUs - MODIFIED FOR GRACEFUL SHUTDOWN
 func (c *SMPPClient) receivePDUs() {
 	for {
+		select {
+		case <-c.stopReading: // <--- Listen for the stop signal
+			log.Println("Stopping PDU reader goroutine.")
+			return // Exit the goroutine gracefully
+		default:
+			// Continue reading if no stop signal
+		}
+
+		// Set a short read deadline. This prevents ReadPDU from blocking indefinitely
+		// and allows the select statement to check c.stopReading regularly.
+		// Resetting it each loop ensures it's always active.
+		if err := c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			log.Printf("Error setting read deadline: %v", err)
+			return // Critical error, exit
+		}
+
 		pdu, err := c.readPDU()
 		if err != nil {
-			log.Printf("Error reading PDU: %v", err)
-			break
+			// Check if the error is a timeout from the deadline
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // It was just a timeout, loop again to check stopReading
+			}
+			// Handle actual connection errors (EOF, network errors)
+			if errors.Is(err, io.EOF) { // <--- Use errors.Is for EOF
+				log.Println("Server closed connection (EOF).")
+			} else {
+				log.Printf("Error reading PDU: %v", err)
+			}
+			return // Exit the goroutine on real errors
+		}
+		// Clear the read deadline after a successful read
+		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("Error clearing read deadline: %v", err)
+			// Not critical enough to exit, but log it
 		}
 
 		c.handlePDU(pdu)
@@ -366,7 +457,8 @@ func (c *SMPPClient) receivePDUs() {
 func (c *SMPPClient) readPDU() (*PDU, error) {
 	// Read header first (16 bytes)
 	headerBuf := make([]byte, 16)
-	_, err := c.conn.Read(headerBuf)
+	// Use io.ReadFull to ensure all 16 bytes are read or an error occurs
+	_, err := io.ReadFull(c.conn, headerBuf) // <--- Use io.ReadFull for header
 	if err != nil {
 		return nil, err
 	}
@@ -375,12 +467,18 @@ func (c *SMPPClient) readPDU() (*PDU, error) {
 	buf := bytes.NewReader(headerBuf)
 	binary.Read(buf, binary.BigEndian, &header)
 
+	// Validate command length (optional but good practice)
+	if header.CommandLength < 16 || header.CommandLength > 65535 { // Example range
+		return nil, fmt.Errorf("invalid PDU command length: %d", header.CommandLength)
+	}
+
 	// Read body if present
 	bodyLen := header.CommandLength - 16
 	var body []byte
 	if bodyLen > 0 {
 		body = make([]byte, bodyLen)
-		_, err = c.conn.Read(body)
+		// Use io.ReadFull for the body as well
+		_, err = io.ReadFull(c.conn, body) // <--- Use io.ReadFull for body
 		if err != nil {
 			return nil, err
 		}
@@ -392,21 +490,75 @@ func (c *SMPPClient) readPDU() (*PDU, error) {
 	}, nil
 }
 
+// CommandIDToString converts an SMPP Command ID to its string representation
+func CommandIDToString(cmdID uint32) string {
+	switch cmdID {
+	case BIND_RECEIVER:
+		return "BIND_RECEIVER"
+	case BIND_TRANSMITTER:
+		return "BIND_TRANSMITTER"
+	case BIND_TRANSCEIVER:
+		return "BIND_TRANSCEIVER"
+	case BIND_RECEIVER_RESP:
+		return "BIND_RECEIVER_RESP"
+	case BIND_TRANSMITTER_RESP:
+		return "BIND_TRANSMITTER_RESP"
+	case BIND_TRANSCEIVER_RESP:
+		return "BIND_TRANSCEIVER_RESP"
+	case UNBIND:
+		return "UNBIND"
+	case UNBIND_RESP:
+		return "UNBIND_RESP"
+	case SUBMIT_SM:
+		return "SUBMIT_SM"
+	case SUBMIT_SM_RESP:
+		return "SUBMIT_SM_RESP"
+	case DELIVER_SM:
+		return "DELIVER_SM"
+	case DELIVER_SM_RESP:
+		return "DELIVER_SM_RESP"
+	case ENQUIRE_LINK:
+		return "ENQUIRE_LINK"
+	case ENQUIRE_LINK_RESP:
+		return "ENQUIRE_LINK_RESP"
+	case GENERIC_NACK:
+		return "GENERIC_NACK"
+	default:
+		return fmt.Sprintf("UNKNOWN_CMD_ID(0x%08X)", cmdID)
+	}
+}
+
 // Handle received PDU
 func (c *SMPPClient) handlePDU(pdu *PDU) {
-	switch pdu.Header.CommandID {
-	case BIND_TRANSCEIVER_RESP:
-		c.handleBindResp(pdu)
-	case SUBMIT_SM_RESP:
-		c.handleSubmitSMResp(pdu)
-	case DELIVER_SM:
-		c.handleDeliverSM(pdu)
-	case ENQUIRE_LINK_RESP:
-		log.Printf("Received enquire_link_resp")
-	case UNBIND_RESP:
-		log.Printf("Received unbind_resp")
-	default:
-		log.Printf("Received unknown PDU: 0x%08X", pdu.Header.CommandID)
+	c.respMutex.Lock()
+	respCh, found := c.respChan[pdu.Header.SequenceNo]
+	c.respMutex.Unlock()
+
+	if found {
+		select { // Non-blocking send to respCh
+		case respCh <- pdu:
+			// Successfully sent to the waiting caller
+		default:
+			log.Printf("Warning: No goroutine waiting for response %s (seq %d)",
+				CommandIDToString(pdu.Header.CommandID), pdu.Header.SequenceNo)
+		}
+	} else {
+		// ... (your existing switch case for handling unsolicited PDUs) ...
+		switch pdu.Header.CommandID {
+		case BIND_TRANSCEIVER_RESP:
+			c.handleBindResp(pdu)
+		case SUBMIT_SM_RESP:
+			c.handleSubmitSMResp(pdu)
+		case DELIVER_SM:
+			c.handleDeliverSM(pdu)
+		case ENQUIRE_LINK_RESP:
+			log.Printf("Received enquire_link_resp")
+		case UNBIND_RESP:
+			log.Printf("Received unbind_resp")
+			// No need to set c.bound = false here, Unbind() will handle it
+		default:
+			log.Printf("Received unknown PDU: 0x%08X", pdu.Header.CommandID)
+		}
 	}
 }
 
@@ -526,11 +678,10 @@ type DeliverSMMessage struct {
 	ESMClass     byte
 }
 
-// Close connection
+// Close connection - This function is now less critical as Unbind handles the main closure
 func (c *SMPPClient) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
-	}
+	// Unbind already handles closing the connection and stopping the reader goroutine.
+	// This `defer client.Close()` in main will just ensure it's called if not already.
 	return nil
 }
 
@@ -679,7 +830,8 @@ func main() {
 
 	// Create client using loaded configuration
 	client := NewSMPPClient(config.ServerAddr, config.ServerPort, config.SystemID, config.Password)
-	defer client.Close()
+	// defer client.Close() // Removed this, Unbind() now handles the close
+
 	// Connect
 	err = client.Connect()
 	if err != nil {
@@ -714,5 +866,5 @@ func main() {
 
 	// Unbind before exit
 	client.Unbind()
-	time.Sleep(1 * time.Second)
+	time.Sleep(1 * time.Second) // Give some time for unbind to complete and connection to close
 }
