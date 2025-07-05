@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json" // Import for JSON parsing
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -32,6 +33,34 @@ func LoadUserConfig(filePath string) (*UserConfig, error) {
 	return &config, nil
 }
 
+// receiveMessages listens for messages from the server and prints them
+func receiveMessages(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	for {
+		message, err := reader.ReadString('\n') // Reads until newline
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Server closed the connection gracefully.")
+			} else {
+				log.Printf("Error receiving message from server: %v", err)
+			}
+			break
+		}
+		// Parse the incoming message if it follows a specific protocol
+		// Expected format from server: FROM_SMSC|DEST_ADDR|TYPE|MESSAGE
+		parts := strings.SplitN(strings.TrimSpace(message), "|", 4)
+		if len(parts) == 4 && parts[0] == "FROM_SMSC" {
+			fmt.Printf("\n--- INCOMING MESSAGE from SMSC for %s ---\n", parts[1])
+			fmt.Printf("Type: %s\n", parts[2])
+			fmt.Printf("Message: %s\n", parts[3])
+			fmt.Print("> ") // Reprint prompt after message
+		} else {
+			fmt.Printf("\n--- RAW INCOMING: %s\n", strings.TrimSpace(message))
+			fmt.Print("> ") // Reprint prompt after message
+		}
+	}
+}
+
 func main() {
 	// Load configuration
 	config, err := LoadUserConfig("user_config.json") // Assumes config file is in the same directory
@@ -53,6 +82,10 @@ func main() {
 	fmt.Println("Example SMS: +12345|98765|SMS|Hello from user!")
 	fmt.Println("Example USSD: +12345|98765|USSD|*123#")
 	fmt.Println("Type 'exit' to quit.")
+
+	// --- NEW: Start goroutine to receive messages from the server ---
+	go receiveMessages(conn) // <--- START THIS GOROUTINE
+	// --- END NEW ---
 
 	reader := bufio.NewReader(os.Stdin) // Reads user input from terminal
 	for {

@@ -110,6 +110,7 @@ type SMPPServer struct {
 	listener        net.Listener
 	userListener    net.Listener
 	sessions        map[string]*Session
+	userConnections map[string]net.Conn
 	mutex           sync.RWMutex
 	port            int
 	userPort        int
@@ -167,6 +168,7 @@ type TrackedMessage struct {
 func NewSMPPServer(port int, userPort int, systemID, password string) *SMPPServer {
 	server := &SMPPServer{
 		sessions:        make(map[string]*Session),
+		userConnections: make(map[string]net.Conn),
 		port:            port,
 		userPort:        userPort,
 		systemID:        systemID,
@@ -255,15 +257,21 @@ func (s *SMPPServer) handleConnection(conn net.Conn) {
 	for {
 		pdu, err := s.readPDU(conn)
 		if err != nil {
-			log.Printf("Error reading PDU: %v", err)
-			break
+			if errors.Is(err, io.EOF) {
+				// Client gracefully closed the connection
+				log.Printf("Client %s disconnected gracefully (EOF)", conn.RemoteAddr())
+			} else {
+				// This is a real error during PDU reading
+				log.Printf("Error reading PDU from %s: %v", conn.RemoteAddr(), err)
+			}
+			break // Exit the loop whether it's EOF or another error
 		}
 
 		session.lastActivity = time.Now()
 
 		err = s.handlePDU(session, pdu)
 		if err != nil {
-			log.Printf("Error handling PDU: %v", err)
+			log.Printf("Error handling PDU from %s: %v", conn.RemoteAddr(), err)
 			break
 		}
 	}
@@ -280,8 +288,20 @@ func (s *SMPPServer) handleConnection(conn net.Conn) {
 
 // New function to handle connections from the "user simulator"
 func (s *SMPPServer) handleUserConnection(conn net.Conn) {
-	defer conn.Close()
-	log.Printf("New user connection from %s", conn.RemoteAddr())
+	userAddr := conn.RemoteAddr().String()
+	log.Printf("New user connection from %s", userAddr)
+
+	s.mutex.Lock()
+	s.userConnections[userAddr] = conn // <--- Store the connection
+	s.mutex.Unlock()
+
+	defer func() {
+		s.mutex.Lock()
+		delete(s.userConnections, userAddr) // <--- Remove connection on close
+		s.mutex.Unlock()
+		conn.Close()
+		log.Printf("User connection closed for %s", userAddr)
+	}()
 
 	reader := bufio.NewReader(conn)
 	for {
@@ -302,6 +322,30 @@ func (s *SMPPServer) handleUserConnection(conn net.Conn) {
 		s.processUserMessage(message)
 	}
 	log.Printf("User connection closed for %s", conn.RemoteAddr())
+}
+
+// SendToUser attempts to send a text message to one or more connected user simulators.
+// In a real system, this would involve routing to a specific user.
+func (s *SMPPServer) SendToUser(destAddr string, message string) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if len(s.userConnections) == 0 {
+		log.Printf("No user simulators connected to deliver message to %s: '%s'", destAddr, message)
+		return
+	}
+
+	log.Printf("Attempting to deliver message to user %s: '%s' via connected user simulators.", destAddr, message)
+	for userAddr, conn := range s.userConnections {
+		// Using a simple protocol: FROM_SMSC|DEST_ADDR|TYPE|MESSAGE
+		fullMessage := fmt.Sprintf("FROM_SMSC|%s|SMS|%s\n", destAddr, message)
+		_, err := conn.Write([]byte(fullMessage))
+		if err != nil {
+			log.Printf("Error sending message to user simulator %s: %v", userAddr, err)
+		} else {
+			log.Printf("Successfully sent message to user simulator %s (for %s)", userAddr, destAddr)
+		}
+	}
 }
 
 // processUserMessage parses the user's text message and forwards it to an SMPP client
@@ -805,6 +849,13 @@ func (s *SMPPServer) processMessage(session *Session, msg *Message) string {
 	log.Printf("📱 Received %s from SMPP client %s (from %s to %s). Simulating delivery to mobile user.",
 		msgType, session.systemID, msg.SourceAddr, msg.DestAddr)
 	log.Printf("   User %s received: '%s'", msg.DestAddr, msg.ShortMessage)
+
+	// --- IMPORTANT: Call SendToUser here for messages coming FROM SMPP Client ---
+	if !msg.IsUSSD { // Typically, only SMS would be "delivered" to a user this way
+		s.SendToUser(msg.DestAddr, msg.ShortMessage) // <--- THIS IS THE KEY CHANGE
+	}
+	// --------------------------------------------------------------------------
+
 	// ------------------------------------------------------------------
 
 	if msg.IsUSSD {
