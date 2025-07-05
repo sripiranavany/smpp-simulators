@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -104,9 +108,11 @@ type Session struct {
 // SMPP Server
 type SMPPServer struct {
 	listener        net.Listener
+	userListener    net.Listener
 	sessions        map[string]*Session
 	mutex           sync.RWMutex
 	port            int
+	userPort        int
 	systemID        string
 	password        string
 	trackedMessages map[string]*TrackedMessage
@@ -117,6 +123,7 @@ type SMPPServer struct {
 // ServerConfig holds the server configuration parameters
 type ServerConfig struct {
 	Port     int    `json:"Port"`
+	UserPort int    `json:"UserPort"`
 	SystemID string `json:"SystemID"`
 	Password string `json:"Password"`
 }
@@ -157,10 +164,11 @@ type TrackedMessage struct {
 }
 
 // NewSMPPServer creates a new SMPP server
-func NewSMPPServer(port int, systemID, password string) *SMPPServer {
+func NewSMPPServer(port int, userPort int, systemID, password string) *SMPPServer {
 	server := &SMPPServer{
 		sessions:        make(map[string]*Session),
 		port:            port,
+		userPort:        userPort,
 		systemID:        systemID,
 		password:        password,
 		trackedMessages: make(map[string]*TrackedMessage),
@@ -194,23 +202,43 @@ func (s *SMPPServer) Start() error {
 	var err error
 	s.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", s.port))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to start SMPP listener: %w", err)
 	}
-
 	log.Printf("SMPP Server started on port %d", s.port)
+
+	// --- NEW: Start listener for user connections ---
+	s.userListener, err = net.Listen("tcp", fmt.Sprintf(":%d", s.userPort))
+	if err != nil {
+		return fmt.Errorf("failed to start user listener: %w", err)
+	}
+	log.Printf("User Simulator Listener started on port %d", s.userPort)
+	// --- END NEW ---
 
 	// Start cleanup goroutine
 	go s.cleanupSessions()
 
+	// Accept SMPP connections
+	go func() {
+		for {
+			conn, err := s.listener.Accept()
+			if err != nil {
+				log.Printf("Error accepting SMPP connection: %v", err)
+				continue
+			}
+			go s.handleConnection(conn) // Handles SMPP PDUs
+		}
+	}()
+
+	// --- NEW: Accept User connections ---
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := s.userListener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection: %v", err)
+			log.Printf("Error accepting User connection: %v", err)
 			continue
 		}
-
-		go s.handleConnection(conn)
+		go s.handleUserConnection(conn) // Handles simple text messages from users
 	}
+	// --- END NEW ---
 }
 
 // Handle incoming connections
@@ -248,6 +276,92 @@ func (s *SMPPServer) handleConnection(conn net.Conn) {
 	s.mutex.Unlock()
 
 	log.Printf("Connection closed for %s", conn.RemoteAddr())
+}
+
+// New function to handle connections from the "user simulator"
+func (s *SMPPServer) handleUserConnection(conn net.Conn) {
+	defer conn.Close()
+	log.Printf("New user connection from %s", conn.RemoteAddr())
+
+	reader := bufio.NewReader(conn)
+	for {
+		message, err := reader.ReadString('\n') // Reads until newline
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Printf("User %s disconnected gracefully (EOF)", conn.RemoteAddr())
+			} else {
+				log.Printf("Error reading from user %s: %v", conn.RemoteAddr(), err)
+			}
+			break
+		}
+
+		// Trim newline and process the user message
+		message = strings.TrimSpace(message)
+		log.Printf("Received raw user message from %s: '%s'", conn.RemoteAddr(), message) // Log raw message
+
+		s.processUserMessage(message)
+	}
+	log.Printf("User connection closed for %s", conn.RemoteAddr())
+}
+
+// processUserMessage parses the user's text message and forwards it to an SMPP client
+// Format: FROM|TO|TYPE|MESSAGE (e.g., +12345|98765|SMS|Hello!)
+func (s *SMPPServer) processUserMessage(userMessage string) {
+	parts := strings.SplitN(userMessage, "|", 4) // Split into 4 parts
+	if len(parts) != 4 {
+		log.Printf("Invalid user message format: '%s'. Expected FROM|TO|TYPE|MESSAGE", userMessage)
+		return
+	}
+
+	fromAddr := parts[0]
+	toAddr := parts[1]
+	msgType := strings.ToUpper(parts[2]) // SMS or USSD
+	text := parts[3]
+
+	isUSSD := false
+	esmClass := byte(ESM_DEFAULT)
+	if msgType == "USSD" {
+		isUSSD = true
+		esmClass = ESM_USSD
+	}
+
+	// Find a bound SMPP client (ESME) to deliver the message to.
+	// For simplicity, we'll just pick the first bound TRANSCEIVER or RECEIVER.
+	// In a real SMSC, you'd have sophisticated routing logic based on 'toAddr' or other criteria.
+	var targetSystemID string
+	s.mutex.RLock()
+	for sysID, sess := range s.sessions {
+		if sess.bound && (sess.bindType == BIND_TRANSCEIVER || sess.bindType == BIND_RECEIVER) {
+			targetSystemID = sysID // Found a suitable client
+			break
+		}
+	}
+	s.mutex.RUnlock()
+
+	if targetSystemID == "" {
+		log.Printf("No bound SMPP client found to deliver message from user %s to %s. Message: %s", fromAddr, toAddr, text)
+		return
+	}
+
+	// Create a DeliverSM message for the SMPP client
+	msgToClient := &Message{
+		SourceAddr:   fromAddr,
+		DestAddr:     toAddr,
+		ShortMessage: text,
+		DataCoding:   DC_DEFAULT, // Default data coding for user messages
+		ESMClass:     esmClass,
+		IsUSSD:       isUSSD,
+		// RegisteredDelivery is not applicable for incoming messages from user to client
+	}
+
+	err := s.SendDeliverSM(targetSystemID, msgToClient)
+	if err != nil {
+		log.Printf("Failed to deliver %s from user %s to SMPP client %s (for %s): %v",
+			msgType, fromAddr, targetSystemID, toAddr, err)
+	} else {
+		log.Printf("Delivered %s from user %s to SMPP client %s (for %s)",
+			msgType, fromAddr, targetSystemID, toAddr)
+	}
 }
 
 // Read PDU from connection
@@ -661,7 +775,7 @@ func (s *SMPPServer) sendPDU(session *Session, pdu *PDU) error {
 	return err
 }
 
-// Process incoming message (SMS/USSD)
+// processMessage handles an incoming SubmitSM from an SMPP client
 func (s *SMPPServer) processMessage(session *Session, msg *Message) string {
 	// Generate message ID
 	messageID := fmt.Sprintf("MSG%d%d", time.Now().Unix(), time.Now().Nanosecond()%1000)
@@ -686,14 +800,18 @@ func (s *SMPPServer) processMessage(session *Session, msg *Message) string {
 		log.Printf("Tracking message %s for delivery receipt", messageID)
 	}
 
-	// Here you can implement your business logic
-	// For example, handle USSD menus, process SMS, etc.
+	// --- NEW LOGIC HERE: Simulate message delivery to a mobile user ---
+	msgType := map[bool]string{true: "USSD", false: "SMS"}[msg.IsUSSD]
+	log.Printf("📱 Received %s from SMPP client %s (from %s to %s). Simulating delivery to mobile user.",
+		msgType, session.systemID, msg.SourceAddr, msg.DestAddr)
+	log.Printf("   User %s received: '%s'", msg.DestAddr, msg.ShortMessage)
+	// ------------------------------------------------------------------
 
 	if msg.IsUSSD {
-		// Handle USSD request
+		// Handle USSD request (auto-reply for USSD from client)
 		s.handleUSSDRequest(session, msg)
 	} else {
-		// Handle SMS
+		// Handle SMS (auto-reply for SMS from client)
 		s.handleSMSRequest(session, msg, messageID)
 	}
 
@@ -930,7 +1048,7 @@ func main() {
 	}
 
 	// Create SMPP server using loaded configuration
-	server := NewSMPPServer(config.Port, config.SystemID, config.Password)
+	server := NewSMPPServer(config.Port, config.UserPort, config.SystemID, config.Password)
 
 	// Example: Test delivery receipt functionality
 	go func() {
