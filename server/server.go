@@ -118,6 +118,14 @@ type SMPPServer struct {
 	password        string
 	trackedMessages map[string]*TrackedMessage
 	messageMutex    sync.RWMutex
+	ussdSessions map[string]*UssdSession
+}
+
+type UssdSession struct {
+    UserAddr   string
+    SystemID   string
+    LastActive time.Time
+    State      string // You can use this for menu/dialog state
 }
 
 // --- Configuration Struct ---
@@ -174,6 +182,7 @@ func NewSMPPServer(port int, userPort int, systemID, password string) *SMPPServe
 		systemID:        systemID,
 		password:        password,
 		trackedMessages: make(map[string]*TrackedMessage),
+		ussdSessions:    make(map[string]*UssdSession),
 	}
 
 	// Start delivery receipt processor
@@ -364,10 +373,6 @@ func (s *SMPPServer) processUserMessage(userMessage string) {
 
 	isUSSD := false
 	esmClass := byte(ESM_DEFAULT)
-	if msgType == "USSD" {
-		isUSSD = true
-		esmClass = ESM_USSD
-	}
 
 	// Find a bound SMPP client (ESME) to deliver the message to.
 	// For simplicity, we'll just pick the first bound TRANSCEIVER or RECEIVER.
@@ -385,6 +390,20 @@ func (s *SMPPServer) processUserMessage(userMessage string) {
 	if targetSystemID == "" {
 		log.Printf("No bound SMPP client found to deliver message from user %s to %s. Message: %s", fromAddr, toAddr, text)
 		return
+	}
+
+	if msgType == "USSD" {
+		isUSSD = true
+		esmClass = ESM_USSD
+		// --- USSD SESSION MANAGEMENT ---
+        s.mutex.Lock()
+        s.ussdSessions[fromAddr] = &UssdSession{
+            UserAddr:   fromAddr,
+            SystemID:   targetSystemID,
+            LastActive: time.Now(),
+            // You can add dialog state here if needed
+        }
+        s.mutex.Unlock()
 	}
 
 	// Create a DeliverSM message for the SMPP client
@@ -662,15 +681,14 @@ func (s *SMPPServer) SendDeliverSM(systemID string, msg *Message) error {
 	   }
 	   fmt.Printf("[DEBUG] DELIVER_SM: ncsType=%s, message_id=%s, src=%s, dst=%s, text=%q\n", ncsType, messageID, msg.SourceAddr, msg.DestAddr, msg.ShortMessage)
 
-	   // If this is a USSD message, add ncs_id TLV (tag 0x14 0x01) with value "ussdc\0"
 	   if msg.IsUSSD {
-			   tag1 := []byte{0x14, 0x01}
-			   val := append([]byte("ussdc"), 0) // null-terminated
-			   length := []byte{0x00, byte(len(val))}
-			   tlvs = append(tlvs, tag1...)
-			   tlvs = append(tlvs, length...)
-			   tlvs = append(tlvs, val...)
-	   }
+			// TLV 0x1401 (ncs_id)
+			ncsTLV := buildTLV(0x1401, append([]byte("ussdc"), 0))
+			tlvs = append(tlvs, ncsTLV...)
+			// TLV 0x1402 (for compatibility)
+			ncsTLV2 := buildTLV(0x1402, append([]byte("ussdc"), 0))
+			tlvs = append(tlvs, ncsTLV2...)
+		}
 
 	   fullBody := append(body, tlvs...)
 
@@ -683,8 +701,37 @@ func (s *SMPPServer) SendDeliverSM(systemID string, msg *Message) error {
 			   },
 			   Body: fullBody,
 	   }
-
+		rawPDU := pdu.Marshal() // Assuming you have a Marshal() method for your PDU struct
+		fmt.Printf("[DEBUG] Raw DELIVER_SM PDU: % X\n", rawPDU)
 	   return s.sendPDU(session, pdu)
+}
+
+// Marshal serializes the PDU into a byte slice (header + body)
+func (p *PDU) Marshal() []byte {
+    buf := new(bytes.Buffer)
+    // Write header fields in big endian order
+    binary.Write(buf, binary.BigEndian, p.Header.CommandLength)
+    binary.Write(buf, binary.BigEndian, p.Header.CommandID)
+    binary.Write(buf, binary.BigEndian, p.Header.CommandStatus)
+    binary.Write(buf, binary.BigEndian, p.Header.SequenceNo)
+    // Write body if present
+    if p.Body != nil {
+        buf.Write(p.Body)
+    }
+    return buf.Bytes()
+}
+// buildTLV constructs a TLV (Tag-Length-Value) for SMPP
+func buildTLV(tag uint16, value []byte) []byte {
+    tlv := make([]byte, 4+len(value))
+    // Tag (2 bytes, big endian)
+    tlv[0] = byte(tag >> 8)
+    tlv[1] = byte(tag & 0xFF)
+    // Length (2 bytes, big endian)
+    tlv[2] = byte(len(value) >> 8)
+    tlv[3] = byte(len(value) & 0xFF)
+    // Value
+    copy(tlv[4:], value)
+    return tlv
 }
 
 // Build deliver_sm body
@@ -1043,6 +1090,15 @@ func (s *SMPPServer) processMessage(session *Session, msg *Message) string {
 
 // Handle USSD request
 func (s *SMPPServer) handleUSSDRequest(session *Session, msg *Message) {
+	// Lookup session
+    s.mutex.RLock()
+    ussdSession, exists := s.ussdSessions[msg.SourceAddr]
+    s.mutex.RUnlock()
+
+    // Example: print session info
+    if exists {
+        log.Printf("[USSD SESSION] User: %s, SystemID: %s, LastActive: %v", ussdSession.UserAddr, ussdSession.SystemID, ussdSession.LastActive)
+    }
 	// Example USSD menu handling
 	var response string
 
@@ -1073,6 +1129,20 @@ func (s *SMPPServer) handleUSSDRequest(session *Session, msg *Message) {
 		time.Sleep(100 * time.Millisecond) // Small delay
 		s.SendDeliverSM(session.systemID, responseMsg)
 	}()
+}
+
+func (s *SMPPServer) cleanupUssdSessions() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    for range ticker.C {
+        s.mutex.Lock()
+        for k, sess := range s.ussdSessions {
+            if time.Since(sess.LastActive) > 10*time.Minute {
+                delete(s.ussdSessions, k)
+            }
+        }
+        s.mutex.Unlock()
+    }
 }
 
 // Handle SMS request
@@ -1273,6 +1343,8 @@ func main() {
 	// Create SMPP server using loaded configuration
 	server := NewSMPPServer(config.Port, config.UserPort, config.SystemID, config.Password)
 
+	// Start USSD session cleanup goroutine
+    go server.cleanupUssdSessions()
 	// Example: Test delivery receipt functionality
 	go func() {
 		time.Sleep(30 * time.Second)
