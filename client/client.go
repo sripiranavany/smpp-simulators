@@ -586,12 +586,61 @@ func (c *SMPPClient) handleSubmitSMResp(pdu *PDU) {
 func (c *SMPPClient) handleDeliverSM(pdu *PDU) {
 	msg := c.parseDeliverSM(pdu.Body)
 
+	// Parse TLVs for message_id and ncs_id (ncs type)
+	messageID := ""
+	ncsType := "smsc"
+	offset := 0
+	// service_type (C string)
+	_, offset = c.extractCString(pdu.Body, offset)
+	// source_addr_ton, source_addr_npi
+	offset += 2
+	// source_addr (C string)
+	_, offset = c.extractCString(pdu.Body, offset)
+	// dest_addr_ton, dest_addr_npi
+	offset += 2
+	// destination_addr (C string)
+	_, offset = c.extractCString(pdu.Body, offset)
+	// esm_class, protocol_id, priority_flag, schedule_delivery_time, validity_period
+	offset += 5
+	// registered_delivery, replace_if_present_flag, data_coding, sm_default_msg_id
+	offset += 4
+	// sm_length
+	var smLen int
+	if offset < len(pdu.Body) {
+		smLen = int(pdu.Body[offset])
+		offset++
+		offset += smLen
+		// Now offset is at start of TLVs (if any)
+		for offset+4 <= len(pdu.Body) {
+			tag := binary.BigEndian.Uint16(pdu.Body[offset : offset+2])
+			length := binary.BigEndian.Uint16(pdu.Body[offset+2 : offset+4])
+			if offset+4+int(length) > len(pdu.Body) {
+				break
+			}
+			value := pdu.Body[offset+4 : offset+4+int(length)]
+			switch tag {
+			case 0x001E:
+				if i := bytes.IndexByte(value, 0); i >= 0 {
+					messageID = string(value[:i])
+				} else {
+					messageID = string(value)
+				}
+			case 0x1401:
+				if i := bytes.IndexByte(value, 0); i >= 0 {
+					ncsType = string(value[:i])
+				} else {
+					ncsType = string(value)
+				}
+			}
+			offset += 4 + int(length)
+		}
+	}
 	if msg.ESMClass&ESM_DELIVERY_RECEIPT != 0 {
-		log.Printf("📧 DELIVERY RECEIPT: %s", msg.ShortMessage)
+		log.Printf("📧 DELIVERY RECEIPT: %s (message_id=%s, ncsType=%s)", msg.ShortMessage, messageID, ncsType)
 	} else if msg.ESMClass&ESM_USSD != 0 {
-		log.Printf("📱 USSD Response from %s: %s", msg.SourceAddr, msg.ShortMessage)
+		log.Printf("📱 USSD Response from %s: %s (message_id=%s, ncsType=%s)", msg.SourceAddr, msg.ShortMessage, messageID, ncsType)
 	} else {
-		log.Printf("📨 SMS from %s to %s: %s", msg.SourceAddr, msg.DestAddr, msg.ShortMessage)
+		log.Printf("📨 SMS from %s to %s: %s (message_id=%s, ncsType=%s)", msg.SourceAddr, msg.DestAddr, msg.ShortMessage, messageID, ncsType)
 	}
 
 	// Send deliver_sm_resp

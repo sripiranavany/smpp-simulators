@@ -1,6 +1,6 @@
 {
-    "ServerAddr": "localhost",
-    "ServerPort": 2775,
-    "SystemID": "test",
-    "Password": "password"
+  "ServerAddr": "localhost",
+  "ServerPort": 3001,
+  "SystemID": "1",
+  "Password": "password"
 }

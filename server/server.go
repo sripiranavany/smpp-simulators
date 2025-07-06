@@ -623,167 +623,339 @@ func (s *SMPPServer) sendGenericNack(session *Session, seqNo uint32, status uint
 
 // Send deliver_sm (outgoing SMS/USSD)
 func (s *SMPPServer) SendDeliverSM(systemID string, msg *Message) error {
-	s.mutex.RLock()
-	session, exists := s.sessions[systemID]
-	s.mutex.RUnlock()
+	   // For USSD, set ESMClass to 0xC0 (USSD indication, no UDHI, per SMPP spec)
+	   if msg.IsUSSD {
+			   msg.ESMClass = 0xC0 // 0xC0 = 1100 0000: USSD indication, no UDHI
+	   }
+	   s.mutex.RLock()
+	   session, exists := s.sessions[systemID]
+	   s.mutex.RUnlock()
 
-	if !exists || !session.bound {
-		return fmt.Errorf("session not found or not bound: %s", systemID)
-	}
+	   if !exists || !session.bound {
+			   return fmt.Errorf("session not found or not bound: %s", systemID)
+	   }
 
-	session.mutex.Lock()
-	session.sequenceNo++
-	seqNo := session.sequenceNo
-	session.mutex.Unlock()
+	   session.mutex.Lock()
+	   session.sequenceNo++
+	   seqNo := session.sequenceNo
+	   session.mutex.Unlock()
 
-	// Build deliver_sm PDU
-	body := s.buildDeliverSMBody(msg)
 
-	pdu := &PDU{
-		Header: PDUHeader{
-			CommandLength: uint32(16 + len(body)),
-			CommandID:     DELIVER_SM,
-			CommandStatus: ESME_ROK,
-			SequenceNo:    seqNo,
-		},
-		Body: body,
-	}
+	   // Build deliver_sm PDU
+	   var tlvs []byte
+	   body := s.buildDeliverSMBody(msg)
 
-	return s.sendPDU(session, pdu)
+	   // Always add a message_id TLV (tag 0x001E) for compatibility with Java clients
+	   // Generate a unique message_id for each DELIVER_SM
+	   messageID := fmt.Sprintf("MSG%d%d", time.Now().Unix(), time.Now().Nanosecond()%1000)
+	   tag := []byte{0x00, 0x1E}
+	   val := append([]byte(messageID), 0) // null-terminated
+	   length := []byte{0x00, byte(len(val))}
+	   tlvs = append(tlvs, tag...)
+	   tlvs = append(tlvs, length...)
+	   tlvs = append(tlvs, val...)
+
+	   // Print ncs type and message_id for debug
+	   ncsType := "smsc"
+	   if msg.IsUSSD {
+			   ncsType = "ussdc"
+	   }
+	   fmt.Printf("[DEBUG] DELIVER_SM: ncsType=%s, message_id=%s, src=%s, dst=%s, text=%q\n", ncsType, messageID, msg.SourceAddr, msg.DestAddr, msg.ShortMessage)
+
+	   // If this is a USSD message, add ncs_id TLV (tag 0x14 0x01) with value "ussdc\0"
+	   if msg.IsUSSD {
+			   tag1 := []byte{0x14, 0x01}
+			   val := append([]byte("ussdc"), 0) // null-terminated
+			   length := []byte{0x00, byte(len(val))}
+			   tlvs = append(tlvs, tag1...)
+			   tlvs = append(tlvs, length...)
+			   tlvs = append(tlvs, val...)
+	   }
+
+	   fullBody := append(body, tlvs...)
+
+	   pdu := &PDU{
+			   Header: PDUHeader{
+					   CommandLength: uint32(16 + len(fullBody)),
+					   CommandID:     DELIVER_SM,
+					   CommandStatus: ESME_ROK,
+					   SequenceNo:    seqNo,
+			   },
+			   Body: fullBody,
+	   }
+
+	   return s.sendPDU(session, pdu)
 }
 
 // Build deliver_sm body
 func (s *SMPPServer) buildDeliverSMBody(msg *Message) []byte {
-	var body []byte
+	   var body []byte
 
-	// service_type (null)
-	body = append(body, 0)
+	   // service_type (null)
+	   body = append(body, 0)
 
-	// source_addr_ton, source_addr_npi
-	body = append(body, 0, 0)
+	   // source_addr_ton, source_addr_npi
+	   body = append(body, 0, 0)
 
-	// source_addr
-	body = append(body, []byte(msg.SourceAddr)...)
-	body = append(body, 0)
+	   // source_addr
+	   if msg.SourceAddr == "" {
+			   msg.SourceAddr = "UNKNOWN"
+	   }
+	   body = append(body, []byte(msg.SourceAddr)...)
+	   body = append(body, 0)
 
-	// dest_addr_ton, dest_addr_npi
-	body = append(body, 0, 0)
+	   // dest_addr_ton, dest_addr_npi
+	   body = append(body, 0, 0)
 
-	// destination_addr
-	body = append(body, []byte(msg.DestAddr)...)
-	body = append(body, 0)
+	   // destination_addr
+	   if msg.DestAddr == "" {
+			   msg.DestAddr = "UNKNOWN"
+	   }
+	   body = append(body, []byte(msg.DestAddr)...)
+	   body = append(body, 0)
 
-	// esm_class
-	body = append(body, msg.ESMClass)
+	   // esm_class
+	   body = append(body, msg.ESMClass)
 
-	// protocol_id
-	body = append(body, 0)
+	   // protocol_id
+	   body = append(body, 0)
 
-	// priority_flag
-	body = append(body, 0)
+	   // priority_flag
+	   body = append(body, 0)
 
-	// schedule_delivery_time (null)
-	body = append(body, 0)
+	   // schedule_delivery_time (null)
+	   body = append(body, 0)
 
-	// validity_period (null)
-	body = append(body, 0)
+	   // validity_period (null)
+	   body = append(body, 0)
 
-	// registered_delivery
-	body = append(body, 0)
+	   // registered_delivery
+	   body = append(body, 0)
 
-	// replace_if_present_flag
-	body = append(body, 0)
+	   // replace_if_present_flag
+	   body = append(body, 0)
 
-	// data_coding
-	body = append(body, msg.DataCoding)
+	   // data_coding
+	   body = append(body, msg.DataCoding)
 
-	// sm_default_msg_id
-	body = append(body, 0)
+	   // sm_default_msg_id
+	   body = append(body, 0)
 
-	// sm_length
-	msgBytes := []byte(msg.ShortMessage)
-	body = append(body, byte(len(msgBytes)))
+	   // sm_length and short_message
+	   msgText := msg.ShortMessage
+	   if msgText == "" {
+			   msgText = " " // Ensure at least one space if empty
+	   }
+	   msgBytes := []byte(msgText)
+	   if len(msgBytes) > 254 {
+			   msgBytes = msgBytes[:254] // SMPP max short_message length is 254
+	   }
+	   body = append(body, byte(len(msgBytes)))
+	   body = append(body, msgBytes...)
 
-	// short_message
-	body = append(body, msgBytes...)
-
-	return body
+	   return body
 }
 
 // Parse submit_sm PDU
+// func (s *SMPPServer) parseSubmitSM(body []byte) (*Message, error) {
+// 	offset := 0
+
+// 	// Skip service_type
+// 	_, offset = s.extractCString(body, offset)
+
+// 	// Skip source_addr_ton, source_addr_npi
+// 	offset += 2
+
+// 	// Extract source_addr
+// 	sourceAddr, offset := s.extractCString(body, offset)
+
+// 	// Skip dest_addr_ton, dest_addr_npi
+// 	offset += 2
+
+// 	// Extract destination_addr
+// 	destAddr, offset := s.extractCString(body, offset)
+
+// 	// Extract esm_class
+// 	if offset >= len(body) {
+// 		return nil, fmt.Errorf("invalid PDU format")
+// 	}
+// 	esmClass := body[offset]
+// 	offset++
+
+// 	// Skip protocol_id, priority_flag, schedule_delivery_time, validity_period
+// 	offset++
+// 	offset++
+// 	_, offset = s.extractCString(body, offset)
+// 	_, offset = s.extractCString(body, offset)
+
+// 	// Extract registered_delivery
+// 	if offset >= len(body) {
+// 		return nil, fmt.Errorf("invalid PDU format")
+// 	}
+// 	registeredDelivery := body[offset]
+// 	offset++
+
+// 	// Skip replace_if_present_flag
+// 	offset++
+
+// 	// Extract data_coding
+// 	if offset >= len(body) {
+// 		return nil, fmt.Errorf("invalid PDU format")
+// 	}
+// 	dataCoding := body[offset]
+// 	offset++
+
+// 	// Skip sm_default_msg_id
+// 	offset++
+
+// 	// Extract sm_length and short_message
+// 	if offset >= len(body) {
+// 		return nil, fmt.Errorf("invalid PDU format")
+// 	}
+// 	smLength := int(body[offset])
+// 	offset++
+
+// 	if offset+smLength > len(body) {
+// 		return nil, fmt.Errorf("invalid message length")
+// 	}
+
+// 	shortMessage := string(body[offset : offset+smLength])
+
+// 	return &Message{
+// 		SourceAddr:         sourceAddr,
+// 		DestAddr:           destAddr,
+// 		ShortMessage:       shortMessage,
+// 		DataCoding:         dataCoding,
+// 		ESMClass:           esmClass,
+// 		IsUSSD:             (esmClass & ESM_USSD) != 0,
+// 		RegisteredDelivery: registeredDelivery,
+// 	}, nil
+// }
 func (s *SMPPServer) parseSubmitSM(body []byte) (*Message, error) {
-	offset := 0
+    offset := 0
 
-	// Skip service_type
-	_, offset = s.extractCString(body, offset)
+    // service_type (C-string)
+    _, offset = s.extractCString(body, offset)
 
-	// Skip source_addr_ton, source_addr_npi
-	offset += 2
+    // source_addr_ton
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (source_addr_ton)")
+    }
+    sourceAddrTON := body[offset]
+    offset++
 
-	// Extract source_addr
-	sourceAddr, offset := s.extractCString(body, offset)
+    // source_addr_npi
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (source_addr_npi)")
+    }
+    sourceAddrNPI := body[offset]
+    offset++
 
-	// Skip dest_addr_ton, dest_addr_npi
-	offset += 2
+    // source_addr (C-string)
+    sourceAddr, offset := s.extractCString(body, offset)
 
-	// Extract destination_addr
-	destAddr, offset := s.extractCString(body, offset)
+    // dest_addr_ton
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (dest_addr_ton)")
+    }
+    destAddrTON := body[offset]
+    offset++
 
-	// Extract esm_class
-	if offset >= len(body) {
-		return nil, fmt.Errorf("invalid PDU format")
-	}
-	esmClass := body[offset]
-	offset++
+    // dest_addr_npi
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (dest_addr_npi)")
+    }
+    destAddrNPI := body[offset]
+    offset++
 
-	// Skip protocol_id, priority_flag, schedule_delivery_time, validity_period
-	offset++
-	offset++
-	_, offset = s.extractCString(body, offset)
-	_, offset = s.extractCString(body, offset)
+    // destination_addr (C-string)
+    destAddr, offset := s.extractCString(body, offset)
 
-	// Extract registered_delivery
-	if offset >= len(body) {
-		return nil, fmt.Errorf("invalid PDU format")
-	}
-	registeredDelivery := body[offset]
-	offset++
+    // esm_class
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (esm_class)")
+    }
+    esmClass := body[offset]
+    offset++
 
-	// Skip replace_if_present_flag
-	offset++
+    // protocol_id
+    offset++
+    // priority_flag
+    offset++
 
-	// Extract data_coding
-	if offset >= len(body) {
-		return nil, fmt.Errorf("invalid PDU format")
-	}
-	dataCoding := body[offset]
-	offset++
+    // schedule_delivery_time (C-string)
+    _, offset = s.extractCString(body, offset)
+    // validity_period (C-string)
+    _, offset = s.extractCString(body, offset)
 
-	// Skip sm_default_msg_id
-	offset++
+    // registered_delivery
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (registered_delivery)")
+    }
+    registeredDelivery := body[offset]
+    offset++
 
-	// Extract sm_length and short_message
-	if offset >= len(body) {
-		return nil, fmt.Errorf("invalid PDU format")
-	}
-	smLength := int(body[offset])
-	offset++
+    // replace_if_present_flag
+    offset++
 
-	if offset+smLength > len(body) {
-		return nil, fmt.Errorf("invalid message length")
-	}
+    // data_coding
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (data_coding)")
+    }
+    dataCoding := body[offset]
+    offset++
 
-	shortMessage := string(body[offset : offset+smLength])
+    // sm_default_msg_id
+    offset++
 
-	return &Message{
-		SourceAddr:         sourceAddr,
-		DestAddr:           destAddr,
-		ShortMessage:       shortMessage,
-		DataCoding:         dataCoding,
-		ESMClass:           esmClass,
-		IsUSSD:             (esmClass & ESM_USSD) != 0,
-		RegisteredDelivery: registeredDelivery,
-	}, nil
+        // sm_length
+    if offset >= len(body) {
+        return nil, fmt.Errorf("invalid PDU format (sm_length)")
+    }
+    smLength := int(body[offset])
+    offset++
+
+    // short_message
+    if offset+smLength > len(body) {
+        return nil, fmt.Errorf("invalid message length: offset=%d smLength=%d bodyLen=%d", offset, smLength, len(body))
+    }
+    shortMessage := ""
+    if smLength > 0 {
+        shortMessage = string(body[offset : offset+smLength])
+    }
+    offset += smLength
+
+    // If short_message is empty, check for message_payload TLV (tag 0x0424)
+    if shortMessage == "" && offset < len(body) {
+        i := offset
+        for i+4 <= len(body) {
+            tag := binary.BigEndian.Uint16(body[i : i+2])
+            length := binary.BigEndian.Uint16(body[i+2 : i+4])
+            if int(i+4+int(length)) > len(body) {
+                break
+            }
+            if tag == 0x0424 { // message_payload
+                payload := body[i+4 : i+4+int(length)]
+                shortMessage = string(payload)
+                break
+            }
+            i += 4 + int(length)
+        }
+    }
+
+    // Debug log
+    log.Printf("[DEBUG] SUBMIT_SM: src_ton=%d src_npi=%d dst_ton=%d dst_npi=%d src=%q dst=%q esm_class=0x%02X data_coding=0x%02X sm_length=%d short_message=%q",
+        sourceAddrTON, sourceAddrNPI, destAddrTON, destAddrNPI, sourceAddr, destAddr, esmClass, dataCoding, smLength, shortMessage)
+
+    return &Message{
+        SourceAddr:         sourceAddr,
+        DestAddr:           destAddr,
+        ShortMessage:       shortMessage,
+        DataCoding:         dataCoding,
+        ESMClass:           esmClass,
+        IsUSSD:             (esmClass & ESM_USSD) != 0,
+        RegisteredDelivery: registeredDelivery,
+    }, nil
 }
 
 // Extract C string from byte array

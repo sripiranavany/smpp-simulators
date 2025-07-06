@@ -1,6 +1,6 @@
 {
-    "Port": 2775,
-    "UserPort": 2776,
-    "SystemID": "test",
-    "Password": "password"
+  "Port": 3001,
+  "UserPort": 2776,
+  "SystemID": "1",
+  "Password": "password"
 }
