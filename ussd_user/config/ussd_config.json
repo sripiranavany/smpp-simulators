@@ -1,0 +1,7 @@
+{
+  "server_addr": "localhost",
+  "server_port": 2776,
+  "port": "8080",
+  "default_mobile": "+1234567890",
+  "session_timeout": 3000
+}

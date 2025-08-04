@@ -105,27 +105,33 @@ type Session struct {
 	lastActivity time.Time
 }
 
-// SMPP Server
+// SMPP Server - add session ID counter
 type SMPPServer struct {
-	listener        net.Listener
-	userListener    net.Listener
-	sessions        map[string]*Session
-	userConnections map[string]net.Conn
-	mutex           sync.RWMutex
-	port            int
-	userPort        int
-	systemID        string
-	password        string
-	trackedMessages map[string]*TrackedMessage
-	messageMutex    sync.RWMutex
-	ussdSessions map[string]*UssdSession
+    listener        net.Listener
+    userListener    net.Listener
+    sessions        map[string]*Session
+    userConnections map[string]net.Conn
+    mutex           sync.RWMutex
+    port            int
+    userPort        int
+    systemID        string
+    password        string
+    trackedMessages map[string]*TrackedMessage
+    messageMutex    sync.RWMutex
+    ussdSessions    map[string]*UssdSession  // Maps MSISDN to USSD session
+    sessionCounter  uint64                   // Add session counter
+    sessionMutex    sync.RWMutex            // Add mutex for session operations
 }
 
+// Update the UssdSession struct to include session ID and expiry
 type UssdSession struct {
-    UserAddr   string
-    SystemID   string
-    LastActive time.Time
-    State      string // You can use this for menu/dialog state
+    UserAddr     string
+    SystemID     string
+    LastActive   time.Time
+    SessionID    string    // Add session ID
+    ExpiryTime   time.Time // Add expiry time
+    State        string    // You can use this for menu/dialog state
+    CreatedAt    time.Time // Track creation time
 }
 
 // --- Configuration Struct ---
@@ -174,21 +180,22 @@ type TrackedMessage struct {
 
 // NewSMPPServer creates a new SMPP server
 func NewSMPPServer(port int, userPort int, systemID, password string) *SMPPServer {
-	server := &SMPPServer{
-		sessions:        make(map[string]*Session),
-		userConnections: make(map[string]net.Conn),
-		port:            port,
-		userPort:        userPort,
-		systemID:        systemID,
-		password:        password,
-		trackedMessages: make(map[string]*TrackedMessage),
-		ussdSessions:    make(map[string]*UssdSession),
-	}
+    server := &SMPPServer{
+        sessions:        make(map[string]*Session),
+        userConnections: make(map[string]net.Conn),
+        port:            port,
+        userPort:        userPort,
+        systemID:        systemID,
+        password:        password,
+        trackedMessages: make(map[string]*TrackedMessage),
+        ussdSessions:    make(map[string]*UssdSession),
+        sessionCounter:  1000, // Start from 1000 for better readability
+    }
 
-	// Start delivery receipt processor
-	go server.processDeliveryReceipts()
+    // Start delivery receipt processor
+    go server.processDeliveryReceipts()
 
-	return server
+    return server
 }
 
 // --- New function to load configuration ---
@@ -210,89 +217,154 @@ func LoadConfig(filePath string) (*ServerConfig, error) {
 
 // Start the SMPP server
 func (s *SMPPServer) Start() error {
-	var err error
-	s.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", s.port))
-	if err != nil {
-		return fmt.Errorf("failed to start SMPP listener: %w", err)
-	}
-	log.Printf("SMPP Server started on port %d", s.port)
+    var err error
+    
+    // Create TCP listener with proper options
+    tcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", s.port))
+    if err != nil {
+        return fmt.Errorf("failed to resolve TCP address: %w", err)
+    }
+    
+    tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+    if err != nil {
+        return fmt.Errorf("failed to start SMPP listener: %w", err)
+    }
+    s.listener = tcpListener
+    
+    log.Printf("SMPP Server started on port %d", s.port)
 
-	// --- NEW: Start listener for user connections ---
-	s.userListener, err = net.Listen("tcp", fmt.Sprintf(":%d", s.userPort))
-	if err != nil {
-		return fmt.Errorf("failed to start user listener: %w", err)
-	}
-	log.Printf("User Simulator Listener started on port %d", s.userPort)
-	// --- END NEW ---
+    // Start user listener
+    userTcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", s.userPort))
+    if err != nil {
+        return fmt.Errorf("failed to resolve user TCP address: %w", err)
+    }
+    
+    userTcpListener, err := net.ListenTCP("tcp", userTcpAddr)
+    if err != nil {
+        return fmt.Errorf("failed to start user listener: %w", err)
+    }
+    s.userListener = userTcpListener
+    
+    log.Printf("User Simulator Listener started on port %d", s.userPort)
 
-	// Start cleanup goroutine
-	go s.cleanupSessions()
+    // Start cleanup goroutine
+    go s.cleanupSessions()
 
-	// Accept SMPP connections
-	go func() {
-		for {
-			conn, err := s.listener.Accept()
-			if err != nil {
-				log.Printf("Error accepting SMPP connection: %v", err)
-				continue
-			}
-			go s.handleConnection(conn) // Handles SMPP PDUs
-		}
-	}()
+    // Accept SMPP connections
+    go func() {
+        for {
+            conn, err := s.listener.Accept()
+            if err != nil {
+                log.Printf("Error accepting SMPP connection: %v", err)
+                continue
+            }
+            go s.handleConnection(conn)
+        }
+    }()
 
-	// --- NEW: Accept User connections ---
-	for {
-		conn, err := s.userListener.Accept()
-		if err != nil {
-			log.Printf("Error accepting User connection: %v", err)
-			continue
-		}
-		go s.handleUserConnection(conn) // Handles simple text messages from users
-	}
-	// --- END NEW ---
+    // Accept User connections
+    for {
+        conn, err := s.userListener.Accept()
+        if err != nil {
+            log.Printf("Error accepting User connection: %v", err)
+            continue
+        }
+        go s.handleUserConnection(conn)
+    }
+}
+
+
+// Generate or get existing session ID for USSD
+func (s *SMPPServer) getOrCreateUSSDSession(msisdn, systemID string) *UssdSession {
+    s.sessionMutex.Lock()
+    defer s.sessionMutex.Unlock()
+
+    // Check if session already exists
+    if session, exists := s.ussdSessions[msisdn]; exists {
+        // Check if session has expired
+        if time.Now().Before(session.ExpiryTime) {
+            // Session is still valid, extend expiry time
+            session.LastActive = time.Now()
+            session.ExpiryTime = time.Now().Add(10 * time.Minute) // Extend for 10 minutes
+            session.SystemID = systemID // Update system ID in case it changed
+            log.Printf("[USSD SESSION] Extended session %s for user %s, expires at %v", 
+                session.SessionID, msisdn, session.ExpiryTime)
+            return session
+        } else {
+            // Session expired, remove it
+            log.Printf("[USSD SESSION] Session %s for user %s expired, creating new session", 
+                session.SessionID, msisdn)
+            delete(s.ussdSessions, msisdn)
+        }
+    }
+
+    // Create new session
+    s.sessionCounter++
+    sessionID := fmt.Sprintf("USSD_%d", s.sessionCounter)
+    
+    newSession := &UssdSession{
+        UserAddr:   msisdn,
+        SystemID:   systemID,
+        LastActive: time.Now(),
+        SessionID:  sessionID,
+        ExpiryTime: time.Now().Add(10 * time.Minute), // 10 minutes expiry
+        State:      "active",
+        CreatedAt:  time.Now(),
+    }
+
+    s.ussdSessions[msisdn] = newSession
+    log.Printf("[USSD SESSION] Created new session %s for user %s, expires at %v", 
+        sessionID, msisdn, newSession.ExpiryTime)
+
+    return newSession
 }
 
 // Handle incoming connections
 func (s *SMPPServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
+    defer conn.Close()
 
-	session := &Session{
-		conn:         conn,
-		lastActivity: time.Now(),
-	}
+    // Set TCP socket options to reduce fragmentation
+    if tcpConn, ok := conn.(*net.TCPConn); ok {
+        tcpConn.SetNoDelay(true)  // Disable Nagle's algorithm
+        tcpConn.SetKeepAlive(true)
+        tcpConn.SetKeepAlivePeriod(30 * time.Second)
+    }
 
-	log.Printf("New connection from %s", conn.RemoteAddr())
+    session := &Session{
+        conn:         conn,
+        lastActivity: time.Now(),
+    }
 
-	for {
-		pdu, err := s.readPDU(conn)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// Client gracefully closed the connection
-				log.Printf("Client %s disconnected gracefully (EOF)", conn.RemoteAddr())
-			} else {
-				// This is a real error during PDU reading
-				log.Printf("Error reading PDU from %s: %v", conn.RemoteAddr(), err)
-			}
-			break // Exit the loop whether it's EOF or another error
-		}
+    log.Printf("New connection from %s", conn.RemoteAddr())
 
-		session.lastActivity = time.Now()
+    for {
+        pdu, err := s.readPDU(conn)
+        if err != nil {
+            if errors.Is(err, io.EOF) {
+                log.Printf("Client %s disconnected gracefully (EOF)", conn.RemoteAddr())
+            } else {
+                log.Printf("Error reading PDU from %s: %v", conn.RemoteAddr(), err)
+            }
+            break
+        }
 
-		err = s.handlePDU(session, pdu)
-		if err != nil {
-			log.Printf("Error handling PDU from %s: %v", conn.RemoteAddr(), err)
-			break
-		}
-	}
+        session.lastActivity = time.Now()
 
-	// Clean up session
-	s.mutex.Lock()
-	if session.systemID != "" {
-		delete(s.sessions, session.systemID)
-	}
-	s.mutex.Unlock()
+        err = s.handlePDU(session, pdu)
+        if err != nil {
+            log.Printf("Error handling PDU from %s: %v", conn.RemoteAddr(), err)
+            break
+        }
+    }
 
-	log.Printf("Connection closed for %s", conn.RemoteAddr())
+    // Clean up session
+    s.mutex.Lock()
+    if session.systemID != "" {
+        delete(s.sessions, session.systemID)
+    }
+    s.mutex.Unlock()
+
+    log.Printf("Connection closed for %s", conn.RemoteAddr())
 }
 
 // New function to handle connections from the "user simulator"
@@ -359,107 +431,111 @@ func (s *SMPPServer) SendToUser(destAddr string, message string) {
 
 // processUserMessage parses the user's text message and forwards it to an SMPP client
 // Format: FROM|TO|TYPE|MESSAGE (e.g., +12345|98765|SMS|Hello!)
+// Update processUserMessage to use session management
 func (s *SMPPServer) processUserMessage(userMessage string) {
-	parts := strings.SplitN(userMessage, "|", 4) // Split into 4 parts
-	if len(parts) != 4 {
-		log.Printf("Invalid user message format: '%s'. Expected FROM|TO|TYPE|MESSAGE", userMessage)
-		return
-	}
+    parts := strings.SplitN(userMessage, "|", 4) // Split into 4 parts
+    if len(parts) != 4 {
+        log.Printf("Invalid user message format: '%s'. Expected FROM|TO|TYPE|MESSAGE", userMessage)
+        return
+    }
 
-	fromAddr := parts[0]
-	toAddr := parts[1]
-	msgType := strings.ToUpper(parts[2]) // SMS or USSD
-	text := parts[3]
+    fromAddr := parts[0]
+    toAddr := parts[1]
+    msgType := strings.ToUpper(parts[2]) // SMS or USSD
+    text := parts[3]
 
-	isUSSD := false
-	esmClass := byte(ESM_DEFAULT)
+    isUSSD := false
+    esmClass := byte(ESM_DEFAULT)
 
-	// Find a bound SMPP client (ESME) to deliver the message to.
-	// For simplicity, we'll just pick the first bound TRANSCEIVER or RECEIVER.
-	// In a real SMSC, you'd have sophisticated routing logic based on 'toAddr' or other criteria.
-	var targetSystemID string
-	s.mutex.RLock()
-	for sysID, sess := range s.sessions {
-		if sess.bound && (sess.bindType == BIND_TRANSCEIVER || sess.bindType == BIND_RECEIVER) {
-			targetSystemID = sysID // Found a suitable client
-			break
-		}
-	}
-	s.mutex.RUnlock()
-
-	if targetSystemID == "" {
-		log.Printf("No bound SMPP client found to deliver message from user %s to %s. Message: %s", fromAddr, toAddr, text)
-		return
-	}
-
-	if msgType == "USSD" {
-		isUSSD = true
-		esmClass = ESM_USSD
-		// --- USSD SESSION MANAGEMENT ---
-        s.mutex.Lock()
-        s.ussdSessions[fromAddr] = &UssdSession{
-            UserAddr:   fromAddr,
-            SystemID:   targetSystemID,
-            LastActive: time.Now(),
-            // You can add dialog state here if needed
+    // Find a bound SMPP client (ESME) to deliver the message to.
+    var targetSystemID string
+    s.mutex.RLock()
+    for sysID, sess := range s.sessions {
+        if sess.bound && (sess.bindType == BIND_TRANSCEIVER || sess.bindType == BIND_RECEIVER) {
+            targetSystemID = sysID // Found a suitable client
+            break
         }
-        s.mutex.Unlock()
-	}
+    }
+    s.mutex.RUnlock()
 
-	// Create a DeliverSM message for the SMPP client
-	msgToClient := &Message{
-		SourceAddr:   fromAddr,
-		DestAddr:     toAddr,
-		ShortMessage: text,
-		DataCoding:   DC_DEFAULT, // Default data coding for user messages
-		ESMClass:     esmClass,
-		IsUSSD:       isUSSD,
-		// RegisteredDelivery is not applicable for incoming messages from user to client
-	}
+    if targetSystemID == "" {
+        log.Printf("No bound SMPP client found to deliver message from user %s to %s. Message: %s", fromAddr, toAddr, text)
+        return
+    }
 
-	err := s.SendDeliverSM(targetSystemID, msgToClient)
-	if err != nil {
-		log.Printf("Failed to deliver %s from user %s to SMPP client %s (for %s): %v",
-			msgType, fromAddr, targetSystemID, toAddr, err)
-	} else {
-		log.Printf("Delivered %s from user %s to SMPP client %s (for %s)",
-			msgType, fromAddr, targetSystemID, toAddr)
-	}
+    if msgType == "USSD" {
+        isUSSD = true
+        esmClass = ESM_USSD
+        // Get or create USSD session
+        ussdSession := s.getOrCreateUSSDSession(fromAddr, targetSystemID)
+        log.Printf("[USSD] Processing USSD message from %s using session %s", fromAddr, ussdSession.SessionID)
+    }
+
+    // Create a DeliverSM message for the SMPP client
+    msgToClient := &Message{
+        SourceAddr:   fromAddr,
+        DestAddr:     toAddr,
+        ShortMessage: text,
+        DataCoding:   DC_DEFAULT,
+        ESMClass:     esmClass,
+        IsUSSD:       isUSSD,
+    }
+
+    err := s.SendDeliverSM(targetSystemID, msgToClient)
+    if err != nil {
+        log.Printf("Failed to deliver %s from user %s to SMPP client %s (for %s): %v",
+            msgType, fromAddr, targetSystemID, toAddr, err)
+    } else {
+        log.Printf("Delivered %s from user %s to SMPP client %s (for %s)",
+            msgType, fromAddr, targetSystemID, toAddr)
+    }
 }
 
 // Read PDU from connection
 func (s *SMPPServer) readPDU(conn net.Conn) (*PDU, error) {
-	// Read header first (16 bytes)
-	headerBuf := make([]byte, 16)
-	_, err := conn.Read(headerBuf)
-	if err != nil {
-		return nil, err
-	}
+    // Read header first (16 bytes) - ensure complete read
+    headerBuf := make([]byte, 16)
+    totalRead := 0
+    for totalRead < 16 {
+        n, err := conn.Read(headerBuf[totalRead:])
+        if err != nil {
+            return nil, fmt.Errorf("failed to read PDU header: %v", err)
+        }
+        totalRead += n
+    }
 
-	var header PDUHeader
-	buf := bytes.NewReader(headerBuf)
-	binary.Read(buf, binary.BigEndian, &header)
+    var header PDUHeader
+    buf := bytes.NewReader(headerBuf)
+    if err := binary.Read(buf, binary.BigEndian, &header); err != nil {
+        return nil, fmt.Errorf("failed to parse PDU header: %v", err)
+    }
 
-	// Validate command length
-	if header.CommandLength < 16 || header.CommandLength > 65535 {
-		return nil, fmt.Errorf("invalid command length: %d", header.CommandLength)
-	}
+    // Validate command length
+    if header.CommandLength < 16 || header.CommandLength > 65535 {
+        return nil, fmt.Errorf("invalid command length: %d", header.CommandLength)
+    }
 
-	// Read body if present
-	bodyLen := header.CommandLength - 16
-	var body []byte
-	if bodyLen > 0 {
-		body = make([]byte, bodyLen)
-		_, err = conn.Read(body)
-		if err != nil {
-			return nil, err
-		}
-	}
+    // Read body if present - ensure complete read
+    bodyLen := header.CommandLength - 16
+    var body []byte
+    if bodyLen > 0 {
+        body = make([]byte, bodyLen)
+        totalRead := 0
+        for totalRead < int(bodyLen) {
+            n, err := conn.Read(body[totalRead:])
+            if err != nil {
+                return nil, fmt.Errorf("failed to read PDU body: %v", err)
+            }
+            totalRead += n
+        }
+    }
 
-	return &PDU{
-		Header: header,
-		Body:   body,
-	}, nil
+    log.Printf("[DEBUG] Successfully read PDU: header=%d bytes, body=%d bytes", 16, bodyLen)
+    
+    return &PDU{
+        Header: header,
+        Body:   body,
+    }, nil
 }
 
 // Handle PDU based on command ID
@@ -482,40 +558,79 @@ func (s *SMPPServer) handlePDU(session *Session, pdu *PDU) error {
 
 // Handle bind operations
 func (s *SMPPServer) handleBind(session *Session, pdu *PDU) error {
-	if session.bound {
-		return s.sendBindResp(session, pdu, ESME_RALYBND)
-	}
+    if session.bound {
+        return s.sendBindResp(session, pdu, ESME_RALYBND, session.systemID)
+    }
 
-	// Parse bind PDU
-	body := pdu.Body
-	offset := 0
+    // Parse bind PDU
+    body := pdu.Body
+    offset := 0
 
-	// Extract system_id
-	systemID, offset := s.extractCString(body, offset)
-	password, offset := s.extractCString(body, offset)
+    // Extract system_id (C-string)
+    systemID, offset := s.extractCString(body, offset)
+    
+    // Extract password (C-string)
+    password, offset := s.extractCString(body, offset)
+    
+    // Extract system_type (C-string) - usually empty
+    systemType, offset := s.extractCString(body, offset)
+    
+    // Validate we have enough bytes for remaining fields
+    if offset+4 > len(body) {
+        log.Printf("[ERROR] Bind PDU too short: offset=%d, body_len=%d", offset, len(body))
+        return s.sendBindResp(session, pdu, ESME_RINVMSGLEN, systemID)
+    }
+    
+    // Extract interface_version (1 byte)
+    interfaceVersion := body[offset]
+    offset++
+    
+    // Extract addr_ton (1 byte)
+    addrTon := body[offset]
+    offset++
+    
+    // Extract addr_npi (1 byte)
+    addrNpi := body[offset]
+    offset++
+    
+    // Extract address_range (C-string)
+    addressRange := ""
+    if offset < len(body) {
+        addressRange, offset = s.extractCString(body, offset)
+    }
 
-	// Validate credentials
-	if systemID != s.systemID || password != s.password {
-		if systemID != s.systemID {
-			return s.sendBindResp(session, pdu, ESME_RINVSYSID)
-		}
-		return s.sendBindResp(session, pdu, ESME_RINVPASWD)
-	}
+    // Debug log the parsed values
+    log.Printf("[DEBUG] BIND parsed: system_id=%q, password=%q, system_type=%q, interface_version=0x%02X, addr_ton=%d, addr_npi=%d, address_range=%q",
+        systemID, password, systemType, interfaceVersion, addrTon, addrNpi, addressRange)
 
-	// Update session
-	session.systemID = systemID
-	session.password = password
-	session.bound = true
-	session.bindType = pdu.Header.CommandID
+    // Validate credentials
+    if systemID != s.systemID || password != s.password {
+        if systemID != s.systemID {
+            return s.sendBindResp(session, pdu, ESME_RINVSYSID, systemID)
+        }
+        return s.sendBindResp(session, pdu, ESME_RINVPASWD, systemID)
+    }
 
-	// Store session
-	s.mutex.Lock()
-	s.sessions[systemID] = session
-	s.mutex.Unlock()
+    // Validate interface version (optional, but good practice)
+    if interfaceVersion != 0x34 { // SMPP 3.4
+        log.Printf("[WARNING] Unsupported interface version: 0x%02X, expected 0x34", interfaceVersion)
+        // Continue anyway, but log the warning
+    }
 
-	log.Printf("Bound session for system_id: %s", systemID)
+    // Update session
+    session.systemID = systemID
+    session.password = password
+    session.bound = true
+    session.bindType = pdu.Header.CommandID
 
-	return s.sendBindResp(session, pdu, ESME_ROK)
+    // Store session
+    s.mutex.Lock()
+    s.sessions[systemID] = session
+    s.mutex.Unlock()
+
+    log.Printf("Bound session for system_id: %s", systemID)
+
+    return s.sendBindResp(session, pdu, ESME_ROK, systemID)
 }
 
 // Handle unbind
@@ -532,6 +647,7 @@ func (s *SMPPServer) handleUnbind(session *Session, pdu *PDU) error {
 		},
 	}
 
+	s.debugPDUStructure(pdu)
 	return s.sendPDU(session, respPDU)
 }
 
@@ -576,36 +692,50 @@ func (s *SMPPServer) handleEnquireLink(session *Session, pdu *PDU) error {
 		},
 	}
 
+	s.debugPDUStructure(pdu)
 	return s.sendPDU(session, respPDU)
 }
 
 // Send bind response
-func (s *SMPPServer) sendBindResp(session *Session, pdu *PDU, status uint32) error {
-	var respID uint32
-	switch pdu.Header.CommandID {
-	case BIND_RECEIVER:
-		respID = BIND_RECEIVER_RESP
-	case BIND_TRANSMITTER:
-		respID = BIND_TRANSMITTER_RESP
-	case BIND_TRANSCEIVER:
-		respID = BIND_TRANSCEIVER_RESP
-	}
+func (s *SMPPServer) sendBindResp(session *Session, pdu *PDU, status uint32, systemID string) error {
+    var respID uint32
+    switch pdu.Header.CommandID {
+    case BIND_RECEIVER:
+        respID = BIND_RECEIVER_RESP
+    case BIND_TRANSMITTER:
+        respID = BIND_TRANSMITTER_RESP
+    case BIND_TRANSCEIVER:
+        respID = BIND_TRANSCEIVER_RESP
+    default:
+        respID = GENERIC_NACK
+    }
 
-	// Create response body with system_id
-	body := []byte(s.systemID)
-	body = append(body, 0) // null terminator
+    var body []byte
+    if status == ESME_ROK {
+        // For successful bind, include system_id in response
+        body = append(body, []byte(systemID)...)
+        body = append(body, 0) // null terminator
+        
+        // Optionally add TLV parameters for additional info
+        // For now, just send the system_id
+    } else {
+        // For error responses, system_id can be empty
+        body = append(body, 0) // just null terminator
+    }
 
-	respPDU := &PDU{
-		Header: PDUHeader{
-			CommandLength: uint32(16 + len(body)),
-			CommandID:     respID,
-			CommandStatus: status,
-			SequenceNo:    pdu.Header.SequenceNo,
-		},
-		Body: body,
-	}
+    respPDU := &PDU{
+        Header: PDUHeader{
+            CommandLength: uint32(16 + len(body)),
+            CommandID:     respID,
+            CommandStatus: status,
+            SequenceNo:    pdu.Header.SequenceNo,
+        },
+        Body: body,
+    }
 
-	return s.sendPDU(session, respPDU)
+    log.Printf("[DEBUG] Sending bind response: status=0x%08X, system_id=%q", status, systemID)
+    s.debugPDUStructure(respPDU)
+    return s.sendPDU(session, respPDU)
 }
 
 // Send submit_sm response
@@ -623,6 +753,7 @@ func (s *SMPPServer) sendSubmitSMResp(session *Session, pdu *PDU, status uint32,
 		Body: body,
 	}
 
+	s.debugPDUStructure(pdu)
 	return s.sendPDU(session, respPDU)
 }
 
@@ -642,242 +773,268 @@ func (s *SMPPServer) sendGenericNack(session *Session, seqNo uint32, status uint
 
 // Send deliver_sm (outgoing SMS/USSD)
 func (s *SMPPServer) SendDeliverSM(systemID string, msg *Message) error {
-	   // For USSD, set ESMClass to 0xC0 (USSD indication, no UDHI, per SMPP spec)
-	   if msg.IsUSSD {
-			   msg.ESMClass = 0xC0 // 0xC0 = 1100 0000: USSD indication, no UDHI
-	   }
-	   s.mutex.RLock()
-	   session, exists := s.sessions[systemID]
-	   s.mutex.RUnlock()
+    // For USSD, keep ESMClass as default and use TLV for indication
+    if msg.IsUSSD {
+        msg.ESMClass = ESM_DEFAULT // 0x00 = no special ESM flags
+    }
+    
+    s.mutex.RLock()
+    session, exists := s.sessions[systemID]
+    s.mutex.RUnlock()
 
-	   if !exists || !session.bound {
-			   return fmt.Errorf("session not found or not bound: %s", systemID)
-	   }
+    if !exists || !session.bound {
+        return fmt.Errorf("session not found or not bound: %s", systemID)
+    }
 
-	   session.mutex.Lock()
-	   session.sequenceNo++
-	   seqNo := session.sequenceNo
-	   session.mutex.Unlock()
+    session.mutex.Lock()
+    session.sequenceNo++
+    seqNo := session.sequenceNo
+    session.mutex.Unlock()
 
+    // Generate message_id - use consistent session ID for USSD
+    var messageID string
+    if msg.IsUSSD {
+        // For USSD, use the session ID from the USSD session
+        s.sessionMutex.RLock()
+        if ussdSession, exists := s.ussdSessions[msg.SourceAddr]; exists {
+            messageID = ussdSession.SessionID
+        } else if ussdSession, exists := s.ussdSessions[msg.DestAddr]; exists {
+            messageID = ussdSession.SessionID
+        } else {
+            // Fallback - create new session if none exists
+            var userAddr string
+            if msg.SourceAddr != "" {
+                userAddr = msg.SourceAddr
+            } else {
+                userAddr = msg.DestAddr
+            }
+            s.sessionMutex.RUnlock()
+            ussdSession := s.getOrCreateUSSDSession(userAddr, systemID)
+            messageID = ussdSession.SessionID
+            s.sessionMutex.RLock()
+        }
+        s.sessionMutex.RUnlock()
+    } else {
+        // For SMS, use timestamp-based message ID
+        messageID = fmt.Sprintf("MSG%d%d", time.Now().Unix(), time.Now().Nanosecond()%1000)
+    }
 
-	   // Build deliver_sm PDU
-	   var tlvs []byte
-	   body := s.buildDeliverSMBody(msg)
+    // Build deliver_sm body first
+    body := s.buildDeliverSMBody(msg, messageID)
 
-	   // Always add a message_id TLV (tag 0x001E) for compatibility with Java clients
-	   // Generate a unique message_id for each DELIVER_SM
-	   messageID := fmt.Sprintf("MSG%d%d", time.Now().Unix(), time.Now().Nanosecond()%1000)
-	   tag := []byte{0x00, 0x1E}
-	   val := append([]byte(messageID), 0) // null-terminated
-	   length := []byte{0x00, byte(len(val))}
-	   tlvs = append(tlvs, tag...)
-	   tlvs = append(tlvs, length...)
-	   tlvs = append(tlvs, val...)
+    // Build TLVs
+    var tlvs []byte
+    
+    // Always add a message_id TLV (tag 0x001E)
+    messageIDBytes := []byte(messageID)
+    messageIDBytes = append(messageIDBytes, 0) // null-terminated
+    tlvs = append(tlvs, buildTLV(0x001E, messageIDBytes)...)
 
-	   // Print ncs type and message_id for debug
-	   ncsType := "smsc"
-	   if msg.IsUSSD {
-			   ncsType = "ussdc"
-	   }
-	   fmt.Printf("[DEBUG] DELIVER_SM: ncsType=%s, message_id=%s, src=%s, dst=%s, text=%q\n", ncsType, messageID, msg.SourceAddr, msg.DestAddr, msg.ShortMessage)
+    if msg.IsUSSD {
+        // TLV 0x1401 (ncs_id) - this indicates USSD
+        ncsBytes := []byte("ussdc")
+        ncsBytes = append(ncsBytes, 0) // null-terminated
+        tlvs = append(tlvs, buildTLV(0x1401, ncsBytes)...)
+        
+        // TLV 0x1402 (for compatibility)
+        ncsBytes2 := []byte("ussdc")
+        ncsBytes2 = append(ncsBytes2, 0) // null-terminated
+        tlvs = append(tlvs, buildTLV(0x1402, ncsBytes2)...)
+        
+        // Optional: Add USSD service operation TLV
+        ussdOpBytes := []byte{0x01} // MO_INIT or appropriate value
+        tlvs = append(tlvs, buildTLV(0x0501, ussdOpBytes)...)
+    }
 
-	   if msg.IsUSSD {
-			// TLV 0x1401 (ncs_id)
-			ncsTLV := buildTLV(0x1401, append([]byte("ussdc"), 0))
-			tlvs = append(tlvs, ncsTLV...)
-			// TLV 0x1402 (for compatibility)
-			ncsTLV2 := buildTLV(0x1402, append([]byte("ussdc"), 0))
-			tlvs = append(tlvs, ncsTLV2...)
-		}
+    // Combine body and TLVs
+    fullBody := append(body, tlvs...)
 
-	   fullBody := append(body, tlvs...)
+    // Calculate correct command length (16 byte header + body + TLVs)
+    commandLength := uint32(16 + len(fullBody))
 
-	   pdu := &PDU{
-			   Header: PDUHeader{
-					   CommandLength: uint32(16 + len(fullBody)),
-					   CommandID:     DELIVER_SM,
-					   CommandStatus: ESME_ROK,
-					   SequenceNo:    seqNo,
-			   },
-			   Body: fullBody,
-	   }
-		rawPDU := pdu.Marshal() // Assuming you have a Marshal() method for your PDU struct
-		fmt.Printf("[DEBUG] Raw DELIVER_SM PDU: % X\n", rawPDU)
-	   return s.sendPDU(session, pdu)
+    // Create PDU
+    pdu := &PDU{
+        Header: PDUHeader{
+            CommandLength: commandLength,
+            CommandID:     DELIVER_SM,
+            CommandStatus: ESME_ROK,
+            SequenceNo:    seqNo,
+        },
+        Body: fullBody,
+    }
+
+    // Print debug info
+    ncsType := "smsc"
+    if msg.IsUSSD {
+        ncsType = "ussdc"
+    }
+    
+    log.Printf("[DEBUG] DELIVER_SM: ncsType=%s, message_id=%s, src=%s, dst=%s, text=%q", 
+        ncsType, messageID, msg.SourceAddr, msg.DestAddr, msg.ShortMessage)
+    log.Printf("[DEBUG] PDU Length: %d, Body Length: %d, TLV Length: %d", 
+        commandLength, len(body), len(tlvs))
+    
+    rawPDU := pdu.Marshal()
+    log.Printf("[DEBUG] Raw DELIVER_SM PDU: % X", rawPDU)
+    
+	s.debugPDUStructure(pdu)
+    return s.sendPDU(session, pdu)
 }
 
 // Marshal serializes the PDU into a byte slice (header + body)
 func (p *PDU) Marshal() []byte {
     buf := new(bytes.Buffer)
+    
+    // Validate command length
+    expectedLength := 16 + len(p.Body)
+    if p.Header.CommandLength != uint32(expectedLength) {
+        log.Printf("[WARNING] PDU command length mismatch: header says %d, actual is %d", 
+            p.Header.CommandLength, expectedLength)
+        // Fix the length
+        p.Header.CommandLength = uint32(expectedLength)
+    }
+    
     // Write header fields in big endian order
     binary.Write(buf, binary.BigEndian, p.Header.CommandLength)
     binary.Write(buf, binary.BigEndian, p.Header.CommandID)
     binary.Write(buf, binary.BigEndian, p.Header.CommandStatus)
     binary.Write(buf, binary.BigEndian, p.Header.SequenceNo)
+    
     // Write body if present
     if p.Body != nil {
         buf.Write(p.Body)
     }
+    
     return buf.Bytes()
 }
+
+
+// Add this function for debugging
+func (s *SMPPServer) debugPDUStructure(pdu *PDU) {
+    log.Printf("[DEBUG] PDU Structure:")
+    log.Printf("  Command Length: %d (0x%08X)", pdu.Header.CommandLength, pdu.Header.CommandLength)
+    log.Printf("  Command ID: %d (0x%08X)", pdu.Header.CommandID, pdu.Header.CommandID)
+    log.Printf("  Command Status: %d (0x%08X)", pdu.Header.CommandStatus, pdu.Header.CommandStatus)
+    log.Printf("  Sequence No: %d (0x%08X)", pdu.Header.SequenceNo, pdu.Header.SequenceNo)
+    log.Printf("  Body Length: %d", len(pdu.Body))
+    
+    // Flag potentially problematic PDUs
+    if pdu.Header.CommandLength > 1024 {
+        log.Printf("  [WARNING] Large PDU detected: %d bytes", pdu.Header.CommandLength)
+    }
+    
+    if len(pdu.Body) > 0 {
+        displayLen := min(100, len(pdu.Body))
+        log.Printf("  Body (first %d bytes): % X", displayLen, pdu.Body[:displayLen])
+    }
+}
+
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
 // buildTLV constructs a TLV (Tag-Length-Value) for SMPP
 func buildTLV(tag uint16, value []byte) []byte {
+    // Ensure value is not nil
+    if value == nil {
+        value = []byte{}
+    }
+    
     tlv := make([]byte, 4+len(value))
     // Tag (2 bytes, big endian)
-    tlv[0] = byte(tag >> 8)
-    tlv[1] = byte(tag & 0xFF)
+    binary.BigEndian.PutUint16(tlv[0:2], tag)
     // Length (2 bytes, big endian)
-    tlv[2] = byte(len(value) >> 8)
-    tlv[3] = byte(len(value) & 0xFF)
+    binary.BigEndian.PutUint16(tlv[2:4], uint16(len(value)))
     // Value
-    copy(tlv[4:], value)
+    if len(value) > 0 {
+        copy(tlv[4:], value)
+    }
     return tlv
 }
 
 // Build deliver_sm body
-func (s *SMPPServer) buildDeliverSMBody(msg *Message) []byte {
-	   var body []byte
+func (s *SMPPServer) buildDeliverSMBody(msg *Message, messageID string) []byte {
+    var body []byte
 
-	   // service_type (null)
-	   body = append(body, 0)
+    // service_type (C-string - null terminated)
+    body = append(body, 0)
 
-	   // source_addr_ton, source_addr_npi
-	   body = append(body, 0, 0)
+    // source_addr_ton, source_addr_npi (1 byte each)
+    body = append(body, 0, 0)
 
-	   // source_addr
-	   if msg.SourceAddr == "" {
-			   msg.SourceAddr = "UNKNOWN"
-	   }
-	   body = append(body, []byte(msg.SourceAddr)...)
-	   body = append(body, 0)
+    // source_addr (C-string)
+    sourceAddr := msg.SourceAddr
+    if sourceAddr == "" {
+        sourceAddr = "UNKNOWN"
+    }
+    body = append(body, []byte(sourceAddr)...)
+    body = append(body, 0) // null terminator
 
-	   // dest_addr_ton, dest_addr_npi
-	   body = append(body, 0, 0)
+    // dest_addr_ton, dest_addr_npi (1 byte each)
+    body = append(body, 0, 0)
 
-	   // destination_addr
-	   if msg.DestAddr == "" {
-			   msg.DestAddr = "UNKNOWN"
-	   }
-	   body = append(body, []byte(msg.DestAddr)...)
-	   body = append(body, 0)
+    // destination_addr (C-string)
+    destAddr := msg.DestAddr
+    if destAddr == "" {
+        destAddr = "UNKNOWN"
+    }
+    body = append(body, []byte(destAddr)...)
+    body = append(body, 0) // null terminator
 
-	   // esm_class
-	   body = append(body, msg.ESMClass)
+    // esm_class (1 byte)
+    body = append(body, msg.ESMClass)
 
-	   // protocol_id
-	   body = append(body, 0)
+    // protocol_id (1 byte)
+    body = append(body, 0)
 
-	   // priority_flag
-	   body = append(body, 0)
+    // priority_flag (1 byte)
+    body = append(body, 0)
 
-	   // schedule_delivery_time (null)
-	   body = append(body, 0)
+    // schedule_delivery_time (C-string - empty, so just null)
+    body = append(body, 0)
 
-	   // validity_period (null)
-	   body = append(body, 0)
+    // validity_period (C-string - empty, so just null)
+    body = append(body, 0)
 
-	   // registered_delivery
-	   body = append(body, 0)
+    // registered_delivery (1 byte)
+    body = append(body, msg.RegisteredDelivery)
 
-	   // replace_if_present_flag
-	   body = append(body, 0)
+    // replace_if_present_flag (1 byte)
+    body = append(body, 0)
 
-	   // data_coding
-	   body = append(body, msg.DataCoding)
+    // data_coding (1 byte)
+    body = append(body, msg.DataCoding)
 
-	   // sm_default_msg_id
-	   body = append(body, 0)
+    // sm_default_msg_id (1 byte)
+    body = append(body, 0)
 
-	   // sm_length and short_message
-	   msgText := msg.ShortMessage
-	   if msgText == "" {
-			   msgText = " " // Ensure at least one space if empty
-	   }
-	   msgBytes := []byte(msgText)
-	   if len(msgBytes) > 254 {
-			   msgBytes = msgBytes[:254] // SMPP max short_message length is 254
-	   }
-	   body = append(body, byte(len(msgBytes)))
-	   body = append(body, msgBytes...)
+    // Prepare short_message
+    msgText := msg.ShortMessage
+    if msgText == "" {
+        msgText = "" // Allow empty messages
+    }
+    
+    msgBytes := []byte(msgText)
+    
+    // SMPP constraint: short_message max length is 254 bytes
+    if len(msgBytes) > 254 {
+        msgBytes = msgBytes[:254]
+    }
+    
+    // sm_length (1 byte) - length of short_message
+    body = append(body, byte(len(msgBytes)))
+    
+    // short_message (variable length)
+    if len(msgBytes) > 0 {
+        body = append(body, msgBytes...)
+    }
 
-	   return body
+    return body
 }
 
-// Parse submit_sm PDU
-// func (s *SMPPServer) parseSubmitSM(body []byte) (*Message, error) {
-// 	offset := 0
-
-// 	// Skip service_type
-// 	_, offset = s.extractCString(body, offset)
-
-// 	// Skip source_addr_ton, source_addr_npi
-// 	offset += 2
-
-// 	// Extract source_addr
-// 	sourceAddr, offset := s.extractCString(body, offset)
-
-// 	// Skip dest_addr_ton, dest_addr_npi
-// 	offset += 2
-
-// 	// Extract destination_addr
-// 	destAddr, offset := s.extractCString(body, offset)
-
-// 	// Extract esm_class
-// 	if offset >= len(body) {
-// 		return nil, fmt.Errorf("invalid PDU format")
-// 	}
-// 	esmClass := body[offset]
-// 	offset++
-
-// 	// Skip protocol_id, priority_flag, schedule_delivery_time, validity_period
-// 	offset++
-// 	offset++
-// 	_, offset = s.extractCString(body, offset)
-// 	_, offset = s.extractCString(body, offset)
-
-// 	// Extract registered_delivery
-// 	if offset >= len(body) {
-// 		return nil, fmt.Errorf("invalid PDU format")
-// 	}
-// 	registeredDelivery := body[offset]
-// 	offset++
-
-// 	// Skip replace_if_present_flag
-// 	offset++
-
-// 	// Extract data_coding
-// 	if offset >= len(body) {
-// 		return nil, fmt.Errorf("invalid PDU format")
-// 	}
-// 	dataCoding := body[offset]
-// 	offset++
-
-// 	// Skip sm_default_msg_id
-// 	offset++
-
-// 	// Extract sm_length and short_message
-// 	if offset >= len(body) {
-// 		return nil, fmt.Errorf("invalid PDU format")
-// 	}
-// 	smLength := int(body[offset])
-// 	offset++
-
-// 	if offset+smLength > len(body) {
-// 		return nil, fmt.Errorf("invalid message length")
-// 	}
-
-// 	shortMessage := string(body[offset : offset+smLength])
-
-// 	return &Message{
-// 		SourceAddr:         sourceAddr,
-// 		DestAddr:           destAddr,
-// 		ShortMessage:       shortMessage,
-// 		DataCoding:         dataCoding,
-// 		ESMClass:           esmClass,
-// 		IsUSSD:             (esmClass & ESM_USSD) != 0,
-// 		RegisteredDelivery: registeredDelivery,
-// 	}, nil
-// }
 func (s *SMPPServer) parseSubmitSM(body []byte) (*Message, error) {
     offset := 0
 
@@ -1007,35 +1164,67 @@ func (s *SMPPServer) parseSubmitSM(body []byte) (*Message, error) {
 
 // Extract C string from byte array
 func (s *SMPPServer) extractCString(data []byte, offset int) (string, int) {
-	start := offset
-	for offset < len(data) && data[offset] != 0 {
-		offset++
-	}
-	if offset < len(data) {
-		offset++ // skip null terminator
-	}
-	return string(data[start : offset-1]), offset
+    if offset >= len(data) {
+        return "", offset
+    }
+    
+    start := offset
+    for offset < len(data) && data[offset] != 0 {
+        offset++
+    }
+    
+    result := ""
+    if offset > start {
+        result = string(data[start:offset])
+    }
+    
+    if offset < len(data) {
+        offset++ // skip null terminator
+    }
+    
+    return result, offset
 }
 
 // Send PDU to session
 func (s *SMPPServer) sendPDU(session *Session, pdu *PDU) error {
-	// Create buffer for PDU
-	buf := new(bytes.Buffer)
+    // Create buffer for PDU
+    buf := new(bytes.Buffer)
 
-	// Write header
-	binary.Write(buf, binary.BigEndian, pdu.Header)
+    // Write header fields in correct order and size
+    binary.Write(buf, binary.BigEndian, pdu.Header.CommandLength)
+    binary.Write(buf, binary.BigEndian, pdu.Header.CommandID)
+    binary.Write(buf, binary.BigEndian, pdu.Header.CommandStatus)
+    binary.Write(buf, binary.BigEndian, pdu.Header.SequenceNo)
 
-	// Write body if present
-	if pdu.Body != nil {
-		buf.Write(pdu.Body)
-	}
+    // Write body if present
+    if pdu.Body != nil {
+        buf.Write(pdu.Body)
+    }
 
-	// Send to connection
-	session.mutex.Lock()
-	defer session.mutex.Unlock()
+    // Get the complete PDU bytes
+    pduBytes := buf.Bytes()
+    
+    // Validate PDU size
+    if len(pduBytes) != int(pdu.Header.CommandLength) {
+        return fmt.Errorf("PDU size mismatch: expected %d, got %d", pdu.Header.CommandLength, len(pduBytes))
+    }
 
-	_, err := session.conn.Write(buf.Bytes())
-	return err
+    // Send to connection with proper error handling
+    session.mutex.Lock()
+    defer session.mutex.Unlock()
+
+    // Ensure complete write
+    totalWritten := 0
+    for totalWritten < len(pduBytes) {
+        written, err := session.conn.Write(pduBytes[totalWritten:])
+        if err != nil {
+            return fmt.Errorf("failed to write PDU: %v", err)
+        }
+        totalWritten += written
+    }
+
+    log.Printf("[DEBUG] Successfully sent PDU: %d bytes", len(pduBytes))
+    return nil
 }
 
 // processMessage handles an incoming SubmitSM from an SMPP client
@@ -1090,59 +1279,104 @@ func (s *SMPPServer) processMessage(session *Session, msg *Message) string {
 
 // Handle USSD request
 func (s *SMPPServer) handleUSSDRequest(session *Session, msg *Message) {
-	// Lookup session
-    s.mutex.RLock()
+    // Get USSD session
+    s.sessionMutex.RLock()
     ussdSession, exists := s.ussdSessions[msg.SourceAddr]
-    s.mutex.RUnlock()
+    s.sessionMutex.RUnlock()
 
-    // Example: print session info
     if exists {
-        log.Printf("[USSD SESSION] User: %s, SystemID: %s, LastActive: %v", ussdSession.UserAddr, ussdSession.SystemID, ussdSession.LastActive)
+        log.Printf("[USSD SESSION] User: %s, SessionID: %s, SystemID: %s, LastActive: %v", 
+            ussdSession.UserAddr, ussdSession.SessionID, ussdSession.SystemID, ussdSession.LastActive)
+        
+        // Update session activity
+        s.sessionMutex.Lock()
+        ussdSession.LastActive = time.Now()
+        ussdSession.ExpiryTime = time.Now().Add(10 * time.Minute)
+        s.sessionMutex.Unlock()
     }
-	// Example USSD menu handling
-	var response string
 
-	switch msg.ShortMessage {
-	case "*123#":
-		response = "Welcome to USSD Service\n1. Balance\n2. Recharge\n3. Help"
-	case "1":
-		response = "Your balance is $10.50"
-	case "2":
-		response = "Enter recharge amount:"
-	case "3":
-		response = "Call 123 for help"
-	default:
-		response = "Invalid option. Please try again."
-	}
+    // Example USSD menu handling (you can customize this)
+    var response string
+    switch msg.ShortMessage {
+    case "*123#":
+        response = "Welcome to USSD Service\n1. Balance\n2. Recharge\n3. Help"
+    case "1":
+        response = "Your balance is $10.50"
+    case "2":
+        response = "Enter recharge amount:"
+    case "3":
+        response = "Call 123 for help"
+    default:
+        response = "Invalid option. Please try again."
+    }
 
-	// Send USSD response
-	responseMsg := &Message{
-		SourceAddr:   msg.DestAddr,
-		DestAddr:     msg.SourceAddr,
-		ShortMessage: response,
-		DataCoding:   DC_DEFAULT,
-		ESMClass:     ESM_USSD,
-		IsUSSD:       true,
-	}
+    // Send USSD response
+    responseMsg := &Message{
+        SourceAddr:   msg.DestAddr,
+        DestAddr:     msg.SourceAddr,
+        ShortMessage: response,
+        DataCoding:   DC_DEFAULT,
+        ESMClass:     ESM_USSD,
+        IsUSSD:       true,
+    }
 
-	go func() {
-		time.Sleep(100 * time.Millisecond) // Small delay
-		s.SendDeliverSM(session.systemID, responseMsg)
-	}()
+    go func() {
+        time.Sleep(100 * time.Millisecond) // Small delay
+        s.SendDeliverSM(session.systemID, responseMsg)
+    }()
 }
 
 func (s *SMPPServer) cleanupUssdSessions() {
-    ticker := time.NewTicker(5 * time.Minute)
+    ticker := time.NewTicker(1 * time.Minute) // Check every minute
     defer ticker.Stop()
+    
     for range ticker.C {
-        s.mutex.Lock()
-        for k, sess := range s.ussdSessions {
-            if time.Since(sess.LastActive) > 10*time.Minute {
-                delete(s.ussdSessions, k)
+        s.sessionMutex.Lock()
+        now := time.Now()
+        var expiredSessions []string
+        
+        for msisdn, session := range s.ussdSessions {
+            if now.After(session.ExpiryTime) {
+                expiredSessions = append(expiredSessions, msisdn)
             }
         }
-        s.mutex.Unlock()
+        
+        // Remove expired sessions
+        for _, msisdn := range expiredSessions {
+            session := s.ussdSessions[msisdn]
+            log.Printf("[USSD SESSION] Removing expired session %s for user %s (expired at %v)", 
+                session.SessionID, msisdn, session.ExpiryTime)
+            delete(s.ussdSessions, msisdn)
+        }
+        
+        s.sessionMutex.Unlock()
+        
+        if len(expiredSessions) > 0 {
+            log.Printf("[USSD SESSION] Cleaned up %d expired sessions", len(expiredSessions))
+        }
     }
+}
+
+// Add a function to get session info (for debugging)
+func (s *SMPPServer) GetUSSDSessionInfo(msisdn string) (*UssdSession, bool) {
+    s.sessionMutex.RLock()
+    defer s.sessionMutex.RUnlock()
+    
+    session, exists := s.ussdSessions[msisdn]
+    return session, exists
+}
+
+// Add a function to manually expire a session (for testing)
+func (s *SMPPServer) ExpireUSSDSession(msisdn string) bool {
+    s.sessionMutex.Lock()
+    defer s.sessionMutex.Unlock()
+    
+    if session, exists := s.ussdSessions[msisdn]; exists {
+        session.ExpiryTime = time.Now().Add(-1 * time.Minute) // Set to past time
+        log.Printf("[USSD SESSION] Manually expired session %s for user %s", session.SessionID, msisdn)
+        return true
+    }
+    return false
 }
 
 // Handle SMS request

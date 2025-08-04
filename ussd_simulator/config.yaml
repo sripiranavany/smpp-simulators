@@ -1,0 +1,28 @@
+server:
+  port: 5557
+
+sdp_server_host_url: "http://127.0.0.1:7000"
+
+sdp_app:
+  id: APP_000035
+  password: 944db88ef543d83673334bff93f84483
+
+ussd_controls:
+  back_key: "999"
+  exit_key: "000"
+  exit_message: "Thank you for using our service!"
+
+ussdmenu:
+  items:
+    "0": " ආයුබෝවන්, hSenid Mobile Sসমাধান\n1.Company\n2.Products\n3.Careers\n000.Exit"
+    "1": "Company Details\n1.CEO\n2.Location\n3.Branches\n4.Contact\n999.Back"
+    "2": "Products\n1.SDP\n2.Soltura\n999.Back"
+    "3": "Careers\n1.Software Engineer\n2.Project Manager\n999.Back"
+    "11": "Mr.Dinesh Saparamadu.\n999.Back"
+    "12": "Nawam mawatha,Colombo, Srilanka.\n999.Back"
+    "13": "hSenid mobile\n999.Back"
+    "14": "info@hsenid.com\n999.Back"
+    "21": "Career grade service delivery platform\n999.Back"
+    "22": "Service Creation Environment\n999.Back"
+    "31": "Java Software Engineer for mobile back end development ( email: careers@hsenidmobile.com ) \n999.Back"
+    "32": "Experienced Project Manager ( email: careers@hsenidmobile.com ) \n999.Back"
